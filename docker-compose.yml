@@ -1,0 +1,24 @@
+# Add this service to your existing docker-compose.yml on cog-nic
+# Or use as a standalone docker-compose.yml in the fpl-app directory
+
+services:
+  fpl-app:
+    build: .
+    container_name: fpl-app
+    restart: unless-stopped
+    environment:
+      - SECRET_KEY=${FPL_SECRET_KEY}
+      - DB_PATH=/app/data/fpl_league.db
+    volumes:
+      - fpl-data:/app/data
+    networks:
+      - shared_net
+    expose:
+      - "8000"
+
+volumes:
+  fpl-data:
+
+networks:
+  shared_net:
+    external: true

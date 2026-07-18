@@ -1,0 +1,6 @@
+# Add this block to your existing Caddyfile on cog-nic
+# Replace fpl.4ma.xyz with your chosen subdomain
+
+fpl.4ma.xyz {
+    reverse_proxy fpl-app:8000
+}

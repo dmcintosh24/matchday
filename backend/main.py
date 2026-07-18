@@ -1,0 +1,2724 @@
+"""
+Fantasy Premier League Salary Cap Draft App - Backend
+"""
+import os
+import json
+import secrets
+import hashlib
+import sqlite3
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
+from typing import Optional
+
+import jwt
+import httpx
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+
+# ── Config ──────────────────────────────────────────────────────────────
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
+DB_PATH = os.getenv("DB_PATH", "fpl_league.db")
+LOGO_PATH = os.getenv("LOGO_PATH", "league_logo.png")
+APP_VERSION = "1.1.0"
+GITHUB_URL = "https://github.com/dmcintosh24/matchday"
+FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
+FPL_LIVE_URL = "https://fantasy.premierleague.com/api/event/{gw}/live/"
+FPL_CACHE_FILE = "fpl_cache.json"
+FPL_CACHE_TTL = 3600  # 1 hour
+
+logger = logging.getLogger("matchday")
+
+app = FastAPI(title="Matchday — Fantasy Football League Manager")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+security = HTTPBearer(auto_error=False)
+
+
+# ── Public endpoints (no auth) ──────────────────────────────────────────
+@app.get("/api/version")
+def get_version():
+    return {"version": APP_VERSION, "github": GITHUB_URL, "name": "Matchday"}
+
+
+@app.get("/api/health")
+def health_check():
+    try:
+        with get_db() as db:
+            db.execute("SELECT 1")
+        return {"status": "healthy", "version": APP_VERSION}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
+@app.get("/api/setup/status")
+def setup_status():
+    """Check if initial setup has been completed (any users exist)."""
+    with get_db() as db:
+        count = db.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    return {"setup_complete": count > 0, "version": APP_VERSION}
+
+
+@app.get("/api/config/logo")
+async def get_logo():
+    """Serve the uploaded league logo."""
+    from fastapi.responses import FileResponse
+    logo_path = os.path.join(os.path.dirname(DB_PATH) if "/" in DB_PATH else ".", LOGO_PATH)
+    # Also check data directory
+    data_logo = os.path.join("data", LOGO_PATH) if os.path.exists("data") else None
+    for path in [logo_path, LOGO_PATH, data_logo]:
+        if path and os.path.exists(path):
+            return FileResponse(path, media_type="image/png")
+    raise HTTPException(404, "No logo uploaded")
+
+
+# ── Database ────────────────────────────────────────────────────────────
+@contextmanager
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            reset_token TEXT,
+            reset_token_expires TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS league_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            description TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS roster (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            position TEXT NOT NULL,
+            salary REAL NOT NULL,
+            acquired_via TEXT DEFAULT 'draft',
+            acquired_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (team_id) REFERENCES teams(id),
+            UNIQUE(team_id, player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS draft_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT DEFAULT 'pending',
+            current_pick INTEGER DEFAULT 0,
+            draft_order TEXT,
+            started_at TEXT,
+            completed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS draft_picks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            draft_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            pick_number INTEGER NOT NULL,
+            salary REAL NOT NULL,
+            picked_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (draft_id) REFERENCES draft_state(id),
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_team_id INTEGER NOT NULL,
+            to_team_id INTEGER NOT NULL,
+            status TEXT DEFAULT 'pending',
+            proposed_at TEXT DEFAULT (datetime('now')),
+            accepted_at TEXT,
+            review_expires_at TEXT,
+            resolved_at TEXT,
+            FOREIGN KEY (from_team_id) REFERENCES teams(id),
+            FOREIGN KEY (to_team_id) REFERENCES teams(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            from_team_id INTEGER NOT NULL,
+            FOREIGN KEY (trade_id) REFERENCES trades(id),
+            FOREIGN KEY (from_team_id) REFERENCES teams(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS trade_protests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (trade_id) REFERENCES trades(id),
+            FOREIGN KEY (team_id) REFERENCES teams(id),
+            UNIQUE(trade_id, team_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            author_id INTEGER NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (author_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS wishlist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            priority INTEGER DEFAULT 0,
+            added_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS fotmob_cache (
+            fpl_player_id INTEGER PRIMARY KEY,
+            fotmob_id INTEGER,
+            fotmob_slug TEXT,
+            fotmob_team_id INTEGER,
+            fotmob_team_slug TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS seasons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT DEFAULT 'active',
+            created_at TEXT DEFAULT (datetime('now')),
+            ended_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS player_snapshot (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            season_id INTEGER NOT NULL,
+            fpl_player_id INTEGER NOT NULL,
+            name TEXT,
+            web_name TEXT,
+            position TEXT,
+            club_name TEXT,
+            club_short TEXT,
+            salary REAL,
+            total_points INTEGER,
+            FOREIGN KEY (season_id) REFERENCES seasons(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS how_to_play (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            section_order INTEGER DEFAULT 0,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS lineups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            gameweek INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            is_starter INTEGER DEFAULT 0,
+            FOREIGN KEY (team_id) REFERENCES teams(id),
+            UNIQUE(team_id, gameweek, player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS gameweek_player_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            gameweek INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            points INTEGER DEFAULT 0,
+            minutes INTEGER DEFAULT 0,
+            goals INTEGER DEFAULT 0,
+            assists INTEGER DEFAULT 0,
+            clean_sheets INTEGER DEFAULT 0,
+            bonus INTEGER DEFAULT 0,
+            detail TEXT,
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(gameweek, player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS team_gameweek_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            gameweek INTEGER NOT NULL,
+            weekly_points INTEGER DEFAULT 0,
+            updated_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (team_id) REFERENCES teams(id),
+            UNIQUE(team_id, gameweek)
+        );
+        """)
+
+        # Default league config
+        defaults = {
+            "league_name": ("My League", "Your league's display name"),
+            "league_subtitle": ("Fantasy Football League", "Subtitle shown below the league name"),
+            "salary_cap": ("100.0", "Total salary cap in millions (£)"),
+            "squad_size": ("15", "Total players per team"),
+            "max_gk": ("2", "Max goalkeepers"),
+            "max_def": ("5", "Max defenders"),
+            "max_mid": ("5", "Max midfielders"),
+            "max_fwd": ("3", "Max forwards"),
+            "max_per_club": ("3", "Max players from one PL club"),
+            "min_starting_def": ("3", "Min defenders in starting XI"),
+            "min_starting_mid": ("2", "Min midfielders in starting XI"),
+            "min_starting_fwd": ("1", "Min forwards in starting XI"),
+            "pts_goal_gk": ("6", "Points per goal - GK"),
+            "pts_goal_def": ("6", "Points per goal - DEF"),
+            "pts_goal_mid": ("5", "Points per goal - MID"),
+            "pts_goal_fwd": ("4", "Points per goal - FWD"),
+            "pts_assist": ("3", "Points per assist"),
+            "pts_clean_sheet_gk": ("4", "Clean sheet points - GK"),
+            "pts_clean_sheet_def": ("4", "Clean sheet points - DEF"),
+            "pts_clean_sheet_mid": ("1", "Clean sheet points - MID"),
+            "pts_save_per_3": ("1", "Points per 3 saves - GK"),
+            "pts_penalty_save": ("5", "Points for penalty save"),
+            "pts_defensive_contrib": ("2", "Points for defensive contributions"),
+            "def_contrib_threshold_def": ("10", "CBIT threshold for defenders"),
+            "def_contrib_threshold_mid_fwd": ("12", "CBIRT threshold for mid/fwd"),
+            "pts_bonus_1st": ("3", "Bonus points - 1st"),
+            "pts_bonus_2nd": ("2", "Bonus points - 2nd"),
+            "pts_bonus_3rd": ("1", "Bonus points - 3rd"),
+            "season_name": ("2025/26", "Current season name"),
+            "draft_type": ("snake", "Draft type: snake or linear"),
+            "trade_review_period_hours": ("24", "Hours for league review after trade accepted"),
+            "trade_protest_threshold": ("50", "Percent of other managers needed to block a trade"),
+            "payout_entry_fee": ("50", "Entry fee per manager ($)"),
+            "payout_weekly_prize": ("5", "Weekly high score prize ($)"),
+            "payout_1st_pct": ("50", "1st place payout (% of season pool)"),
+            "payout_2nd_pct": ("30", "2nd place payout (% of season pool)"),
+            "payout_3rd_pct": ("20", "3rd place payout (% of season pool)"),
+            "payout_venmo": ("", "Venmo handle for payments"),
+            "payout_paypal": ("", "PayPal handle for payments"),
+            "free_agency_enabled": ("0", "Enable free agency window (0=off, 1=on)"),
+            "free_agency_day_start": ("2", "Free agency window start day (0=Mon, 6=Sun)"),
+            "free_agency_day_end": ("4", "Free agency window end day (0=Mon, 6=Sun)"),
+            "free_agency_hour_start": ("10", "Free agency window start hour (24h ET)"),
+            "free_agency_hour_end": ("22", "Free agency window end hour (24h ET)"),
+            "lineup_lock_enabled": ("1", "Lock lineups after GW deadline (0=off, 1=on)"),
+        }
+        for key, (value, desc) in defaults.items():
+            db.execute(
+                "INSERT OR IGNORE INTO league_config (key, value, description) VALUES (?, ?, ?)",
+                (key, value, desc),
+            )
+
+        # ── Auto-migrations for existing databases ──
+        migrations = [
+            ("trades", "accepted_at", "TEXT"),
+            ("trades", "review_expires_at", "TEXT"),
+            ("users", "has_paid", "INTEGER DEFAULT 0"),
+            ("users", "venmo", "TEXT"),
+            ("users", "paypal", "TEXT"),
+            ("roster", "club_id", "INTEGER DEFAULT 0"),
+            ("roster", "season_id", "INTEGER DEFAULT 1"),
+            ("lineups", "season_id", "INTEGER DEFAULT 1"),
+            ("team_gameweek_scores", "season_id", "INTEGER DEFAULT 1"),
+            ("draft_state", "season_id", "INTEGER DEFAULT 1"),
+            ("trades", "season_id", "INTEGER DEFAULT 1"),
+            ("transactions", "season_id", "INTEGER DEFAULT 1"),
+            ("wishlist", "season_id", "INTEGER DEFAULT 1"),
+            ("gameweek_player_scores", "season_id", "INTEGER DEFAULT 1"),
+        ]
+        for table, col, col_type in migrations:
+            try:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+            except Exception:
+                pass  # Column already exists
+
+        # Ensure at least one season exists
+        season = db.execute("SELECT id FROM seasons LIMIT 1").fetchone()
+        if not season:
+            db.execute("INSERT INTO seasons (name, status) VALUES ('2025/26', 'active')")
+
+        # Seed How to Play if empty
+        htp_count = db.execute("SELECT COUNT(*) as c FROM how_to_play").fetchone()["c"]
+        if htp_count == 0:
+            defaults = [
+                (1, "Welcome to Matchday Yanks", "Welcome to the Matchday Yanks Fantasy Football League! This is a salary cap draft league based on the English Premier League. Here's everything you need to know to get started."),
+                (2, "Getting Started", "1. Create your account and set up your manager profile\n2. Add your Venmo or PayPal in your Profile for payouts\n3. Pay the entry fee to the commissioner\n4. Wait for the draft to be scheduled"),
+                (3, "The Draft", "The league uses a snake draft format. The draft order is randomized by the commissioner. Each round, you select one player until all rosters are full (15 players per team).\n\nDuring the draft:\n- Stay within the salary cap (£100m)\n- Follow position limits: 2 GK, 5 DEF, 5 MID, 3 FWD\n- Max 3 players from any single Premier League club\n- Use your wishlist to prepare — star players on the Players page before draft day"),
+                (4, "Setting Your Lineup", "Each gameweek you set a starting XI from your 15-player squad. Your starting lineup must include:\n- 1 Goalkeeper\n- At least 3 Defenders\n- At least 2 Midfielders\n- At least 1 Forward\n\nValid formations include 3-4-3, 3-5-2, 4-3-3, 4-4-2, 4-5-1, 5-3-2, and 5-4-1.\n\nOnly your 11 starters earn points. Bench players don't count.\n\nIf you forget to set a lineup, your most recent lineup carries forward automatically."),
+                (5, "Scoring", "Points are based on real Premier League performances:\n- Goals: FWD 4pts, MID 5pts, DEF/GK 6pts\n- Assists: 3pts\n- Clean sheets: GK/DEF 4pts, MID 1pt\n- Saves: 1pt per 3 saves (GK only)\n- Penalty save: 5pts\n- Bonus points awarded to top 3 BPS performers per match\n\nCheck the Rules & Scoring page for the full breakdown."),
+                (6, "Free Agency & Waivers", "After the draft, you can add free agent players and drop players from your roster. Depending on league settings, free agency may be restricted to a weekly window (check the Rules page for current settings).\n\nAll adds and drops must keep you within the salary cap and position limits."),
+                (7, "Trades", "You can trade players with other managers. Here's how it works:\n1. Go to the Trades page and select a team to trade with\n2. Click to select players you're offering and requesting\n3. The other manager accepts or rejects\n4. If accepted, the trade enters a league review period\n5. Other managers can protest during the review window\n6. If enough protests are filed, the trade is vetoed\n7. Otherwise it processes automatically when the review period ends"),
+                (8, "Weekly Prizes & Payouts", "The highest-scoring team each gameweek wins a weekly prize. At the end of the season, the remaining prize pool is split among the top finishers.\n\nCheck the Rules & Scoring page for current payout amounts and payment info."),
+                (9, "Tips for New Managers", "- Check player injury status before setting your lineup\n- Use FotMob links (click any player name) for detailed real-world stats\n- Watch the salary cap — don't blow your budget on a few stars\n- Diversify across clubs — the 3-per-club rule forces smart roster building\n- Set your lineup early in the week so you don't forget\n- Check the Scoring page to see how your rivals are doing"),
+            ]
+            for order, title, body in defaults:
+                db.execute("INSERT INTO how_to_play (section_order, title, body) VALUES (?, ?, ?)", (order, title, body))
+
+
+def get_active_season_id(db) -> int:
+    """Get the active season ID."""
+    row = db.execute("SELECT id FROM seasons WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+    return row["id"] if row else 1
+
+
+# ── Auth helpers ────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000)
+    return f"{salt}:{h.hex()}"
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    salt, h = password_hash.split(":")
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex() == h
+
+
+def create_token(user_id: int, is_admin: bool = False, hours: int = 72) -> str:
+    return jwt.encode(
+        {"sub": str(user_id), "admin": is_admin, "exp": datetime.now(timezone.utc) + timedelta(hours=hours)},
+        SECRET_KEY,
+        algorithm="HS256",
+    )
+
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    if not creds:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        payload = jwt.decode(creds.credentials, SECRET_KEY, algorithms=["HS256"])
+        payload["sub"] = int(payload["sub"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+
+def require_admin(user=Depends(get_current_user)):
+    if not user.get("admin"):
+        raise HTTPException(403, "Admin access required")
+    return user
+
+
+# ── FPL data cache ─────────────────────────────────────────────────────
+async def get_fpl_data():
+    """Fetch and cache FPL bootstrap data."""
+    if os.path.exists(FPL_CACHE_FILE):
+        mtime = os.path.getmtime(FPL_CACHE_FILE)
+        if datetime.now().timestamp() - mtime < FPL_CACHE_TTL:
+            with open(FPL_CACHE_FILE) as f:
+                return json.load(f)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(FPL_BOOTSTRAP_URL, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            with open(FPL_CACHE_FILE, "w") as f:
+                json.dump(data, f)
+            return data
+    except Exception:
+        if os.path.exists(FPL_CACHE_FILE):
+            with open(FPL_CACHE_FILE) as f:
+                return json.load(f)
+        raise HTTPException(503, "Cannot fetch FPL data and no cache available")
+
+
+def parse_players(fpl_data: dict) -> list[dict]:
+    """Transform FPL bootstrap data into our player format."""
+    teams = {t["id"]: t for t in fpl_data.get("teams", [])}
+    pos_map = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    players = []
+    for p in fpl_data.get("elements", []):
+        team = teams.get(p["team"], {})
+        players.append({
+            "id": p["id"],
+            "name": f"{p['first_name']} {p['second_name']}",
+            "web_name": p["web_name"],
+            "position": pos_map.get(p["element_type"], "?"),
+            "club": team.get("short_name", "???"),
+            "club_name": team.get("name", "Unknown"),
+            "club_id": p["team"],
+            "salary": p["now_cost"] / 10,  # FPL stores in tenths
+            "total_points": p["total_points"],
+            "form": p.get("form", "0.0"),
+            "minutes": p.get("minutes", 0),
+            "goals": p.get("goals_scored", 0),
+            "assists": p.get("assists", 0),
+            "clean_sheets": p.get("clean_sheets", 0),
+            "status": p.get("status", "a"),  # a=available, d=doubtful, i=injured, s=suspended, u=unavailable
+            "injury_news": p.get("news", ""),
+            "photo": f"https://resources.premierleague.com/premierleague/photos/players/110x140/p{p.get('photo', '').replace('.jpg', '')}.png",
+            "selected_by_percent": p.get("selected_by_percent", "0"),
+        })
+    return players
+
+
+# ── Pydantic models ────────────────────────────────────────────────────
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class PasswordResetRequest(BaseModel):
+    email: str
+
+class PasswordResetConfirm(BaseModel):
+    token: str
+    new_password: str
+
+class TeamCreate(BaseModel):
+    name: str
+
+class DraftPick(BaseModel):
+    player_id: int
+
+class TradeProposal(BaseModel):
+    to_team_id: int
+    offering_player_ids: list[int]
+    requesting_player_ids: list[int]
+
+class DropPlayer(BaseModel):
+    player_id: int
+
+class AddPlayer(BaseModel):
+    player_id: int
+
+class WishlistUpdate(BaseModel):
+    player_id: int
+    priority: Optional[int] = 0
+
+class ConfigUpdate(BaseModel):
+    key: str
+    value: str
+
+class SetLineup(BaseModel):
+    gameweek: int
+    starters: list[int]  # list of player_ids (exactly 11)
+
+class AnnouncementCreate(BaseModel):
+    title: str
+    body: str
+
+class AnnouncementUpdate(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+
+class ProfileUpdate(BaseModel):
+    email: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    venmo: Optional[str] = None
+    paypal: Optional[str] = None
+
+
+# ── Startup ─────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    init_db()
+    global _scheduler_task
+    _scheduler_task = asyncio.create_task(score_scheduler())
+    asyncio.create_task(backfill_club_ids())
+    logger.info("Score auto-refresh scheduler started (hourly)")
+
+
+async def backfill_club_ids():
+    """Backfill club_id for existing roster entries that don't have it."""
+    try:
+        fpl_data = await get_fpl_data()
+        players = {p["id"]: p for p in parse_players(fpl_data)}
+        with get_db() as db:
+            rows = db.execute("SELECT id, player_id FROM roster WHERE club_id IS NULL OR club_id=0").fetchall()
+            if not rows:
+                return
+            for r in rows:
+                p = players.get(r["player_id"])
+                if p:
+                    db.execute("UPDATE roster SET club_id=? WHERE id=?", (p["club_id"], r["id"]))
+            logger.info(f"Backfilled club_id for {len(rows)} roster entries")
+    except Exception as e:
+        logger.error(f"Club ID backfill failed: {e}")
+
+
+# ── Auth endpoints ──────────────────────────────────────────────────────
+@app.post("/api/auth/register")
+def register(req: RegisterRequest):
+    with get_db() as db:
+        if db.execute("SELECT id FROM users WHERE email=?", (req.email,)).fetchone():
+            raise HTTPException(400, "Email already registered")
+        if db.execute("SELECT id FROM users WHERE username=?", (req.username,)).fetchone():
+            raise HTTPException(400, "Username taken")
+        # First user is admin
+        count = db.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+        is_admin = 1 if count == 0 else 0
+        db.execute(
+            "INSERT INTO users (email, username, password_hash, is_admin) VALUES (?, ?, ?, ?)",
+            (req.email, req.username, hash_password(req.password), is_admin),
+        )
+        user_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return {"token": create_token(user_id, bool(is_admin)), "is_admin": bool(is_admin), "username": req.username}
+
+
+@app.post("/api/auth/login")
+def login(req: LoginRequest):
+    with get_db() as db:
+        user = db.execute("SELECT * FROM users WHERE email=?", (req.email,)).fetchone()
+        if not user or not verify_password(req.password, user["password_hash"]):
+            raise HTTPException(401, "Invalid credentials")
+        if not user["is_active"]:
+            raise HTTPException(403, "Account disabled")
+    return {
+        "token": create_token(user["id"], bool(user["is_admin"])),
+        "is_admin": bool(user["is_admin"]),
+        "username": user["username"],
+    }
+
+
+@app.post("/api/auth/request-reset")
+def request_password_reset(req: PasswordResetRequest):
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    with get_db() as db:
+        result = db.execute(
+            "UPDATE users SET reset_token=?, reset_token_expires=? WHERE email=?",
+            (token, expires, req.email),
+        )
+        if result.rowcount == 0:
+            # Don't reveal whether email exists
+            return {"message": "If that email is registered, a reset link has been generated."}
+    # In production: send email. For now, return token directly (for admin to share).
+    return {"message": "Reset token generated.", "reset_token": token}
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(req: PasswordResetConfirm):
+    with get_db() as db:
+        user = db.execute(
+            "SELECT * FROM users WHERE reset_token=?", (req.token,)
+        ).fetchone()
+        if not user:
+            raise HTTPException(400, "Invalid reset token")
+        if datetime.fromisoformat(user["reset_token_expires"]) < datetime.now(timezone.utc):
+            raise HTTPException(400, "Reset token expired")
+        db.execute(
+            "UPDATE users SET password_hash=?, reset_token=NULL, reset_token_expires=NULL WHERE id=?",
+            (hash_password(req.new_password), user["id"]),
+        )
+    return {"message": "Password reset successful"}
+
+
+@app.get("/api/auth/me")
+def get_me(user=Depends(get_current_user)):
+    with get_db() as db:
+        u = db.execute("SELECT id, email, username, is_admin, venmo, paypal FROM users WHERE id=?", (user["sub"],)).fetchone()
+        if not u:
+            raise HTTPException(404, "User not found")
+    return dict(u)
+
+
+@app.put("/api/auth/profile")
+def update_profile(req: ProfileUpdate, user=Depends(get_current_user)):
+    with get_db() as db:
+        u = db.execute("SELECT * FROM users WHERE id=?", (user["sub"],)).fetchone()
+        if not u:
+            raise HTTPException(404, "User not found")
+
+        if req.email and req.email != u["email"]:
+            existing = db.execute("SELECT id FROM users WHERE email=? AND id!=?", (req.email, user["sub"])).fetchone()
+            if existing:
+                raise HTTPException(400, "Email already in use")
+            db.execute("UPDATE users SET email=? WHERE id=?", (req.email, user["sub"]))
+
+        if req.username and req.username != u["username"]:
+            existing = db.execute("SELECT id FROM users WHERE username=? AND id!=?", (req.username, user["sub"])).fetchone()
+            if existing:
+                raise HTTPException(400, "Username already taken")
+            db.execute("UPDATE users SET username=? WHERE id=?", (req.username, user["sub"]))
+
+        if req.password:
+            db.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(req.password), user["sub"]))
+
+        if req.venmo is not None:
+            db.execute("UPDATE users SET venmo=? WHERE id=?", (req.venmo, user["sub"]))
+
+        if req.paypal is not None:
+            db.execute("UPDATE users SET paypal=? WHERE id=?", (req.paypal, user["sub"]))
+
+    return {"message": "Profile updated"}
+
+
+# ── Player data endpoints ──────────────────────────────────────────────
+@app.get("/api/players")
+async def list_players(position: Optional[str] = None, club: Optional[str] = None, search: Optional[str] = None, gameweek: Optional[int] = None):
+    fpl_data = await get_fpl_data()
+    players = parse_players(fpl_data)
+    if position:
+        players = [p for p in players if p["position"] == position.upper()]
+    if club:
+        players = [p for p in players if p["club"].lower() == club.lower()]
+    if search:
+        s = search.lower()
+        players = [p for p in players if s in p["name"].lower() or s in p["web_name"].lower()]
+
+    # Add owner info
+    with get_db() as db:
+        roster_rows = db.execute("""
+            SELECT r.player_id, t.name as team_name
+            FROM roster r JOIN teams t ON t.id = r.team_id
+        """).fetchall()
+        owner_map = {r["player_id"]: r["team_name"] for r in roster_rows}
+
+        # Add GW scores if requested
+        gw_score_map = {}
+        if gameweek:
+            scores = db.execute(
+                "SELECT player_id, points, minutes, goals, assists, clean_sheets, bonus FROM gameweek_player_scores WHERE gameweek=?",
+                (gameweek,)
+            ).fetchall()
+            gw_score_map = {s["player_id"]: dict(s) for s in scores}
+
+    for p in players:
+        p["owner"] = owner_map.get(p["id"])
+        if gameweek:
+            gw = gw_score_map.get(p["id"], {})
+            p["gw_points"] = gw.get("points", 0)
+            p["gw_minutes"] = gw.get("minutes", 0)
+            p["gw_goals"] = gw.get("goals", 0)
+            p["gw_assists"] = gw.get("assists", 0)
+            p["gw_clean_sheets"] = gw.get("clean_sheets", 0)
+            p["gw_bonus"] = gw.get("bonus", 0)
+
+    return {"players": players, "count": len(players)}
+
+
+@app.get("/api/players/{player_id}")
+async def get_player(player_id: int):
+    fpl_data = await get_fpl_data()
+    players = parse_players(fpl_data)
+    for p in players:
+        if p["id"] == player_id:
+            return p
+    raise HTTPException(404, "Player not found")
+
+
+@app.get("/api/clubs")
+async def list_clubs():
+    fpl_data = await get_fpl_data()
+    return {"clubs": fpl_data.get("teams", [])}
+
+
+# ── Wishlist ───────────────────────────────────────────────────────────
+@app.get("/api/wishlist")
+async def get_wishlist(user=Depends(get_current_user)):
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT player_id, priority FROM wishlist WHERE user_id=? ORDER BY priority DESC, added_at",
+            (user["sub"],)
+        ).fetchall()
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    result = []
+    for r in rows:
+        p = all_players.get(r["player_id"])
+        if p:
+            result.append({**p, "priority": r["priority"]})
+    return {"wishlist": result, "player_ids": [r["player_id"] for r in rows]}
+
+
+@app.post("/api/wishlist")
+def add_to_wishlist(req: WishlistUpdate, user=Depends(get_current_user)):
+    with get_db() as db:
+        try:
+            db.execute(
+                "INSERT INTO wishlist (user_id, player_id, priority) VALUES (?, ?, ?)",
+                (user["sub"], req.player_id, req.priority)
+            )
+        except Exception:
+            raise HTTPException(400, "Player already on wishlist")
+    return {"message": "Added to wishlist"}
+
+
+@app.delete("/api/wishlist/{player_id}")
+def remove_from_wishlist(player_id: int, user=Depends(get_current_user)):
+    with get_db() as db:
+        db.execute("DELETE FROM wishlist WHERE user_id=? AND player_id=?", (user["sub"], player_id))
+    return {"message": "Removed from wishlist"}
+
+
+@app.put("/api/wishlist/{player_id}/priority")
+def update_wishlist_priority(player_id: int, req: WishlistUpdate, user=Depends(get_current_user)):
+    with get_db() as db:
+        db.execute(
+            "UPDATE wishlist SET priority=? WHERE user_id=? AND player_id=?",
+            (req.priority, user["sub"], player_id)
+        )
+    return {"message": "Priority updated"}
+
+
+# ── FotMob Integration ──────────────────────────────────────────────────
+FOTMOB_SEARCH_URL = "https://apigw.fotmob.com/searchapi/suggest?hits=50&lang=en&term={term}"
+
+
+async def fotmob_search(term: str) -> list:
+    """Search FotMob's suggest API for players."""
+    try:
+        url = FOTMOB_SEARCH_URL.format(term=term.replace(" ", "+"))
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            players = []
+            for section in data if isinstance(data, list) else [data]:
+                if isinstance(section, dict):
+                    # Format: squadMemberSuggest[].options[].payload
+                    for suggest in section.get("squadMemberSuggest", []):
+                        for option in suggest.get("options", []):
+                            payload = option.get("payload", option)
+                            if payload.get("id"):
+                                players.append(payload)
+            return players
+    except Exception as e:
+        logger.error(f"FotMob search failed for '{term}': {e}")
+        return []
+
+
+async def fotmob_search_teams(term: str) -> list:
+    """Search FotMob for teams."""
+    try:
+        url = FOTMOB_SEARCH_URL.format(term=term.replace(" ", "+"))
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            })
+            resp.raise_for_status()
+            data = resp.json()
+            teams = []
+            for section in data if isinstance(data, list) else [data]:
+                if isinstance(section, dict):
+                    for suggest in section.get("teamSuggest", []):
+                        for option in suggest.get("options", []):
+                            payload = option.get("payload", option)
+                            if payload.get("id"):
+                                teams.append(payload)
+            return teams
+    except Exception as e:
+        logger.error(f"FotMob team search failed for '{term}': {e}")
+        return []
+
+
+def slugify(name: str) -> str:
+    """Convert a name to a URL slug."""
+    import re
+    s = name.lower().strip()
+    s = re.sub(r'[^a-z0-9\s-]', '', s)
+    s = re.sub(r'[\s]+', '-', s)
+    return s
+
+
+@app.get("/api/fotmob/player/{fpl_player_id}")
+async def get_fotmob_player(fpl_player_id: int):
+    """Get FotMob URL for a player. Returns cached result or searches FotMob."""
+    # Check cache first
+    with get_db() as db:
+        cached = db.execute(
+            "SELECT fotmob_id, fotmob_slug FROM fotmob_cache WHERE fpl_player_id=?",
+            (fpl_player_id,)
+        ).fetchone()
+        if cached and cached["fotmob_id"]:
+            return {
+                "url": f"https://www.fotmob.com/players/{cached['fotmob_id']}/{cached['fotmob_slug']}",
+                "fotmob_id": cached["fotmob_id"],
+                "cached": True,
+            }
+
+    # Look up player name from FPL
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    player = all_players.get(fpl_player_id)
+    if not player:
+        raise HTTPException(404, "Player not found")
+
+    # Search FotMob
+    results = await fotmob_search(player["name"])
+    if not results:
+        # Try with just last name
+        results = await fotmob_search(player["web_name"])
+
+    # Match by name similarity and team
+    best = None
+    player_club = player.get("club_name", "").lower()
+    for r in results:
+        r_name = r.get("name", "").lower()
+        r_team = r.get("teamName", r.get("squad", "")).lower()
+        # Check if names match reasonably
+        if (player["web_name"].lower() in r_name or
+            player["name"].lower() == r_name or
+            r_name in player["name"].lower()):
+            # Prefer team match
+            if player_club and player_club in r_team or r_team in player_club:
+                best = r
+                break
+            elif not best:
+                best = r
+
+    if best:
+        fotmob_id = best.get("id")
+        fotmob_slug = slugify(best.get("name", ""))
+        # Cache it
+        with get_db() as db:
+            db.execute("""
+                INSERT OR REPLACE INTO fotmob_cache (fpl_player_id, fotmob_id, fotmob_slug, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+            """, (fpl_player_id, fotmob_id, fotmob_slug))
+
+        return {
+            "url": f"https://www.fotmob.com/players/{fotmob_id}/{fotmob_slug}",
+            "fotmob_id": fotmob_id,
+            "cached": False,
+        }
+
+    return {"url": f"https://www.google.com/search?q=fotmob+{player['name'].replace(' ', '+')}", "fotmob_id": None, "cached": False}
+
+
+@app.get("/api/fotmob/team/{club_name}")
+async def get_fotmob_team(club_name: str):
+    """Get FotMob URL for a team."""
+    with get_db() as db:
+        cached = db.execute(
+            "SELECT fotmob_team_id, fotmob_team_slug FROM fotmob_cache WHERE fotmob_team_slug=? LIMIT 1",
+            (club_name.lower(),)
+        ).fetchone()
+        if cached and cached["fotmob_team_id"]:
+            return {"url": f"https://www.fotmob.com/teams/{cached['fotmob_team_id']}/{cached['fotmob_team_slug']}"}
+
+    results = await fotmob_search_teams(club_name)
+    for r in results:
+        if club_name.lower() in r.get("name", "").lower() or r.get("name", "").lower() in club_name.lower():
+            team_id = r.get("id")
+            team_slug = slugify(r.get("name", ""))
+            return {"url": f"https://www.fotmob.com/teams/{team_id}/{team_slug}"}
+
+    return {"url": f"https://www.google.com/search?q=fotmob+{club_name.replace(' ', '+')}"}
+
+
+@app.post("/api/fotmob/bulk-lookup")
+async def bulk_fotmob_lookup(all_players_flag: bool = True):
+    """Pre-cache FotMob IDs for all players (or just rostered ones)."""
+    fpl_data = await get_fpl_data()
+    all_fpl = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        cached = db.execute("SELECT fpl_player_id FROM fotmob_cache WHERE fotmob_id IS NOT NULL").fetchall()
+        cached_ids = {r["fpl_player_id"] for r in cached}
+
+        if all_players_flag:
+            to_lookup = [pid for pid in all_fpl.keys() if pid not in cached_ids]
+        else:
+            rostered = db.execute("SELECT DISTINCT player_id FROM roster").fetchall()
+            to_lookup = [r["player_id"] for r in rostered if r["player_id"] not in cached_ids]
+
+    found = 0
+    total = len(to_lookup)
+    for i, pid in enumerate(to_lookup):
+        try:
+            result = await get_fotmob_player(pid)
+            if result.get("fotmob_id"):
+                found += 1
+            if (i + 1) % 50 == 0:
+                logger.info(f"FotMob bulk lookup: {i + 1}/{total} processed, {found} found")
+            await asyncio.sleep(0.3)  # Rate limit
+        except Exception:
+            pass
+
+    logger.info(f"FotMob bulk lookup complete: {total} looked up, {found} found")
+    return {"looked_up": total, "found": found}
+
+
+# ── Fixtures & Schedule ─────────────────────────────────────────────────
+FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
+FIXTURES_CACHE_FILE = "fixtures_cache.json"
+
+
+async def get_fixtures():
+    """Fetch and cache FPL fixtures data."""
+    if os.path.exists(FIXTURES_CACHE_FILE):
+        mtime = os.path.getmtime(FIXTURES_CACHE_FILE)
+        if datetime.now().timestamp() - mtime < FPL_CACHE_TTL:
+            with open(FIXTURES_CACHE_FILE) as f:
+                return json.load(f)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(FPL_FIXTURES_URL, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            with open(FIXTURES_CACHE_FILE, "w") as f:
+                json.dump(data, f)
+            return data
+    except Exception:
+        if os.path.exists(FIXTURES_CACHE_FILE):
+            with open(FIXTURES_CACHE_FILE) as f:
+                return json.load(f)
+        raise HTTPException(503, "Cannot fetch fixtures and no cache available")
+
+
+@app.get("/api/schedule")
+async def get_schedule():
+    """Return gameweeks with fixtures, team names, and scores."""
+    fpl_data = await get_fpl_data()
+    fixtures = await get_fixtures()
+
+    teams = {t["id"]: t for t in fpl_data.get("teams", [])}
+    events = fpl_data.get("events", [])
+
+    gameweeks = []
+    for ev in events:
+        gw_fixtures = []
+        for f in fixtures:
+            if f.get("event") == ev["id"]:
+                home = teams.get(f["team_h"], {})
+                away = teams.get(f["team_a"], {})
+                gw_fixtures.append({
+                    "id": f["id"],
+                    "kickoff": f.get("kickoff_time"),
+                    "finished": f.get("finished", False),
+                    "started": f.get("started", False),
+                    "home_team": home.get("name", "TBD"),
+                    "home_short": home.get("short_name", "TBD"),
+                    "home_score": f.get("team_h_score"),
+                    "away_team": away.get("name", "TBD"),
+                    "away_short": away.get("short_name", "TBD"),
+                    "away_score": f.get("team_a_score"),
+                    "minutes": f.get("minutes", 0),
+                })
+        gameweeks.append({
+            "id": ev["id"],
+            "name": ev.get("name", f"Gameweek {ev['id']}"),
+            "deadline": ev.get("deadline_time"),
+            "finished": ev.get("finished", False),
+            "is_current": ev.get("is_current", False),
+            "is_next": ev.get("is_next", False),
+            "fixtures": gw_fixtures,
+        })
+
+    return {"gameweeks": gameweeks}
+
+
+# ── League config ──────────────────────────────────────────────────────
+@app.get("/api/config")
+def get_config():
+    with get_db() as db:
+        rows = db.execute("SELECT key, value, description FROM league_config").fetchall()
+    return {r["key"]: {"value": r["value"], "description": r["description"]} for r in rows}
+
+
+@app.put("/api/config")
+def update_config(updates: list[ConfigUpdate], _=Depends(require_admin)):
+    with get_db() as db:
+        for u in updates:
+            db.execute("UPDATE league_config SET value=? WHERE key=?", (u.value, u.key))
+    return {"message": "Config updated"}
+
+
+# ── Team management ────────────────────────────────────────────────────
+def get_config_val(db, key: str) -> str:
+    row = db.execute("SELECT value FROM league_config WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else ""
+
+
+def validate_roster(db, team_id: int, adding_player: dict = None, dropping_player_id: int = None):
+    """Validate roster meets all rules. Returns error message or None."""
+    roster = db.execute("SELECT * FROM roster WHERE team_id=?", (team_id,)).fetchall()
+    roster_list = [dict(r) for r in roster]
+
+    if dropping_player_id:
+        roster_list = [r for r in roster_list if r["player_id"] != dropping_player_id]
+    if adding_player:
+        roster_list.append({
+            "player_id": adding_player["id"],
+            "position": adding_player["position"],
+            "salary": adding_player["salary"],
+            "club_id": adding_player.get("club_id", 0),
+        })
+
+    cap = float(get_config_val(db, "salary_cap"))
+    total_salary = sum(r["salary"] for r in roster_list)
+    if total_salary > cap:
+        return f"Exceeds salary cap (£{total_salary:.1f}m / £{cap:.1f}m)"
+
+    max_size = int(get_config_val(db, "squad_size"))
+    if len(roster_list) > max_size:
+        return f"Exceeds squad size limit ({len(roster_list)}/{max_size})"
+
+    pos_counts = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
+    for r in roster_list:
+        pos_counts[r["position"]] = pos_counts.get(r["position"], 0) + 1
+
+    limits = {
+        "GK": int(get_config_val(db, "max_gk")),
+        "DEF": int(get_config_val(db, "max_def")),
+        "MID": int(get_config_val(db, "max_mid")),
+        "FWD": int(get_config_val(db, "max_fwd")),
+    }
+    for pos, count in pos_counts.items():
+        if count > limits.get(pos, 99):
+            return f"Too many {pos}s ({count}/{limits[pos]})"
+
+    if adding_player:
+        max_club = int(get_config_val(db, "max_per_club"))
+        club_count = sum(1 for r in roster_list if r.get("club_id") == adding_player.get("club_id"))
+        if club_count > max_club:
+            return f"Too many players from that club ({club_count}/{max_club})"
+
+    return None
+
+
+@app.post("/api/teams")
+def create_team(req: TeamCreate, user=Depends(get_current_user)):
+    with get_db() as db:
+        existing = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if existing:
+            raise HTTPException(400, "You already have a team")
+        db.execute("INSERT INTO teams (user_id, name) VALUES (?, ?)", (user["sub"], req.name))
+        team_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return {"id": team_id, "name": req.name}
+
+
+@app.get("/api/teams")
+def list_teams(user=Depends(get_current_user)):
+    with get_db() as db:
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username,
+                   COALESCE(SUM(r.salary), 0) as total_salary,
+                   COUNT(r.id) as player_count
+            FROM teams t
+            JOIN users u ON t.user_id = u.id
+            LEFT JOIN roster r ON r.team_id = t.id
+            GROUP BY t.id
+        """).fetchall()
+    return {"teams": [dict(t) for t in teams]}
+
+
+@app.get("/api/teams/mine")
+async def get_my_team(user=Depends(get_current_user)):
+    with get_db() as db:
+        team = db.execute("SELECT * FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found. Create one first.")
+        roster = db.execute("SELECT * FROM roster WHERE team_id=?", (team["id"],)).fetchall()
+        cap = float(get_config_val(db, "salary_cap"))
+
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    enriched = []
+    for r in roster:
+        player_info = all_players.get(r["player_id"], {})
+        enriched.append({**dict(r), **player_info})
+
+    total_salary = sum(r["salary"] for r in roster)
+    return {
+        "team": dict(team),
+        "roster": enriched,
+        "salary_cap": cap,
+        "salary_used": total_salary,
+        "salary_remaining": cap - total_salary,
+    }
+
+
+@app.post("/api/teams/mine/add")
+async def add_player_to_team(req: AddPlayer, user=Depends(get_current_user)):
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    player = all_players.get(req.player_id)
+    if not player:
+        raise HTTPException(404, "Player not found")
+
+    with get_db() as db:
+        # Free agency window check
+        fa_enabled = get_config_val(db, "free_agency_enabled") == "1"
+        if fa_enabled:
+            from datetime import timezone as tz
+            now = datetime.now(tz.utc)
+            # Convert to ET (UTC-4 during EDT, UTC-5 during EST — approximate with UTC-4)
+            import zoneinfo
+            try:
+                et = now.astimezone(zoneinfo.ZoneInfo("America/New_York"))
+            except Exception:
+                et = now.replace(tzinfo=None) - timedelta(hours=4)
+            day = et.weekday()  # 0=Mon
+            hour = et.hour
+            day_start = int(get_config_val(db, "free_agency_day_start") or "2")
+            day_end = int(get_config_val(db, "free_agency_day_end") or "4")
+            hour_start = int(get_config_val(db, "free_agency_hour_start") or "10")
+            hour_end = int(get_config_val(db, "free_agency_hour_end") or "22")
+
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            in_window = day_start <= day <= day_end
+            if in_window and day == day_start and hour < hour_start:
+                in_window = False
+            if in_window and day == day_end and hour >= hour_end:
+                in_window = False
+            if not in_window:
+                raise HTTPException(400,
+                    f"Free agency is closed. Window: {day_names[day_start]}-{day_names[day_end]}, {hour_start}:00-{hour_end}:00 ET")
+
+        season_id = get_active_season_id(db)
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+
+        # Check if already rostered by someone in this season
+        taken = db.execute("SELECT t.name FROM roster r JOIN teams t ON t.id=r.team_id WHERE r.player_id=? AND r.season_id=?",
+                           (req.player_id, season_id)).fetchone()
+        if taken:
+            raise HTTPException(400, f"Player already on {taken['name']}")
+
+        error = validate_roster(db, team["id"], adding_player=player)
+        if error:
+            raise HTTPException(400, error)
+
+        db.execute(
+            "INSERT INTO roster (team_id, player_id, position, salary, club_id, season_id, acquired_via) VALUES (?, ?, ?, ?, ?, ?, 'add')",
+            (team["id"], player["id"], player["position"], player["salary"], player.get("club_id", 0), season_id),
+        )
+        db.execute(
+            "INSERT INTO transactions (team_id, player_id, action, details, season_id) VALUES (?, ?, 'add', ?, ?)",
+            (team["id"], player["id"], json.dumps({"name": player["web_name"], "salary": player["salary"]}), season_id),
+        )
+    return {"message": f"Added {player['web_name']}"}
+
+
+@app.post("/api/teams/mine/drop")
+async def drop_player(req: DropPlayer, user=Depends(get_current_user)):
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+        slot = db.execute(
+            "SELECT * FROM roster WHERE team_id=? AND player_id=?",
+            (team["id"], req.player_id),
+        ).fetchone()
+        if not slot:
+            raise HTTPException(404, "Player not on your roster")
+        db.execute("DELETE FROM roster WHERE id=?", (slot["id"],))
+        db.execute(
+            "INSERT INTO transactions (team_id, player_id, action) VALUES (?, ?, 'drop')",
+            (team["id"], req.player_id),
+        )
+    return {"message": "Player dropped"}
+
+
+# ── Trades ──────────────────────────────────────────────────────────────
+@app.get("/api/teams/{team_id}/roster")
+async def get_team_roster(team_id: int, user=Depends(get_current_user)):
+    """Get a specific team's roster (for trade UI)."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    with get_db() as db:
+        team = db.execute("SELECT id, name FROM teams WHERE id=?", (team_id,)).fetchone()
+        if not team:
+            raise HTTPException(404, "Team not found")
+        roster = db.execute("SELECT * FROM roster WHERE team_id=?", (team_id,)).fetchall()
+    enriched = []
+    for r in roster:
+        player = all_players.get(r["player_id"], {"id": r["player_id"], "web_name": f"#{r['player_id']}"})
+        enriched.append({**dict(r), **player})
+    return {"team": dict(team), "roster": enriched}
+
+
+@app.get("/api/teams/all-rosters")
+async def get_all_rosters(user=Depends(get_current_user)):
+    """Get all teams with their full rosters."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    with get_db() as db:
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username,
+                   COALESCE(SUM(r.salary), 0) as total_salary,
+                   COUNT(r.id) as player_count
+            FROM teams t
+            JOIN users u ON t.user_id = u.id
+            LEFT JOIN roster r ON r.team_id = t.id
+            GROUP BY t.id
+        """).fetchall()
+
+        result = []
+        for team in teams:
+            roster = db.execute("SELECT * FROM roster WHERE team_id=?", (team["id"],)).fetchall()
+            enriched = []
+            for r in roster:
+                player = all_players.get(r["player_id"], {"id": r["player_id"], "name": f"#{r['player_id']}", "web_name": f"#{r['player_id']}"})
+                enriched.append({**dict(r), **player})
+            enriched.sort(key=lambda p: ["GK", "DEF", "MID", "FWD"].index(p.get("position", "FWD")))
+            result.append({
+                "team": dict(team),
+                "roster": enriched,
+            })
+    return {"teams": result}
+
+
+def enrich_trade(db, trade, fpl_players):
+    """Add player names, protest info, and team salary details to a trade dict."""
+    trade_d = dict(trade)
+    players = db.execute("SELECT * FROM trade_players WHERE trade_id=?", (trade["id"],)).fetchall()
+    enriched_players = []
+    for tp in players:
+        p = fpl_players.get(tp["player_id"], {})
+        enriched_players.append({
+            **dict(tp),
+            "name": p.get("name", f"#{tp['player_id']}"),
+            "web_name": p.get("web_name", f"#{tp['player_id']}"),
+            "position": p.get("position", "?"),
+            "salary": p.get("salary", 0),
+            "club_name": p.get("club_name", ""),
+            "total_points": p.get("total_points", 0),
+            "form": p.get("form", "0"),
+            "status": p.get("status", "a"),
+            "injury_news": p.get("injury_news", ""),
+        })
+    trade_d["players"] = enriched_players
+
+    # Team salary cap info
+    cap = float(get_config_val(db, "salary_cap") or "100")
+    for side, tid in [("from_team", trade["from_team_id"]), ("to_team", trade["to_team_id"])]:
+        salary_row = db.execute("SELECT COALESCE(SUM(salary), 0) as total FROM roster WHERE team_id=?", (tid,)).fetchone()
+        player_count = db.execute("SELECT COUNT(*) as c FROM roster WHERE team_id=?", (tid,)).fetchone()["c"]
+        total_salary = float(salary_row["total"])
+        trade_d[f"{side}_salary_used"] = total_salary
+        trade_d[f"{side}_salary_remaining"] = cap - total_salary
+        trade_d[f"{side}_salary_cap"] = cap
+        trade_d[f"{side}_player_count"] = player_count
+
+    # Protest info
+    protests = db.execute("SELECT team_id FROM trade_protests WHERE trade_id=?", (trade["id"],)).fetchall()
+    trade_d["protest_count"] = len(protests)
+    trade_d["protest_team_ids"] = [p["team_id"] for p in protests]
+
+    # Total teams for threshold calc
+    total_teams = db.execute("SELECT COUNT(*) as c FROM teams").fetchone()["c"]
+    eligible_voters = max(total_teams - 2, 1)
+    threshold_pct = int(get_config_val(db, "trade_protest_threshold") or "50")
+    trade_d["protests_needed"] = max(1, int(eligible_voters * threshold_pct / 100 + 0.5))
+    trade_d["eligible_voters"] = eligible_voters
+
+    return trade_d
+
+
+@app.post("/api/trades")
+async def propose_trade(req: TradeProposal, user=Depends(get_current_user)):
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        my_team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not my_team:
+            raise HTTPException(404, "No team found")
+        other_team = db.execute("SELECT id FROM teams WHERE id=?", (req.to_team_id,)).fetchone()
+        if not other_team:
+            raise HTTPException(404, "Target team not found")
+
+        for pid in req.offering_player_ids:
+            r = db.execute("SELECT id FROM roster WHERE team_id=? AND player_id=?", (my_team["id"], pid)).fetchone()
+            if not r:
+                raise HTTPException(400, f"You don't have player {pid}")
+        for pid in req.requesting_player_ids:
+            r = db.execute("SELECT id FROM roster WHERE team_id=? AND player_id=?", (req.to_team_id, pid)).fetchone()
+            if not r:
+                raise HTTPException(400, f"Target team doesn't have player {pid}")
+
+        # Pre-validate: simulate the swap and check both rosters
+        # Build simulated rosters after the trade
+        my_roster = db.execute("SELECT player_id, position, salary, club_id FROM roster WHERE team_id=?", (my_team["id"],)).fetchall()
+        their_roster = db.execute("SELECT player_id, position, salary, club_id FROM roster WHERE team_id=?", (req.to_team_id,)).fetchall()
+
+        my_after = [dict(r) for r in my_roster if r["player_id"] not in req.offering_player_ids]
+        their_after = [dict(r) for r in their_roster if r["player_id"] not in req.requesting_player_ids]
+
+        # Add incoming players
+        for pid in req.requesting_player_ids:
+            p = all_players.get(pid, {})
+            my_after.append({"player_id": pid, "position": p.get("position", "?"), "salary": p.get("salary", 0), "club_id": p.get("club_id", 0)})
+        for pid in req.offering_player_ids:
+            p = all_players.get(pid, {})
+            their_after.append({"player_id": pid, "position": p.get("position", "?"), "salary": p.get("salary", 0), "club_id": p.get("club_id", 0)})
+
+        # Check salary caps
+        cap = float(get_config_val(db, "salary_cap"))
+        my_salary = sum(r["salary"] for r in my_after)
+        their_salary = sum(r["salary"] for r in their_after)
+        if my_salary > cap:
+            raise HTTPException(400, f"Trade would put your team over the salary cap (£{my_salary:.1f}m / £{cap:.1f}m)")
+        if their_salary > cap:
+            raise HTTPException(400, f"Trade would put their team over the salary cap (£{their_salary:.1f}m / £{cap:.1f}m)")
+
+        # Check position limits
+        limits = {
+            "GK": int(get_config_val(db, "max_gk")),
+            "DEF": int(get_config_val(db, "max_def")),
+            "MID": int(get_config_val(db, "max_mid")),
+            "FWD": int(get_config_val(db, "max_fwd")),
+        }
+        for label, roster_after in [("Your team", my_after), ("Their team", their_after)]:
+            pos_counts = {}
+            for r in roster_after:
+                pos_counts[r["position"]] = pos_counts.get(r["position"], 0) + 1
+            for pos, count in pos_counts.items():
+                if count > limits.get(pos, 99):
+                    raise HTTPException(400, f"Trade would give {label} too many {pos}s ({count}/{limits[pos]})")
+
+        # Check max per club
+        max_club = int(get_config_val(db, "max_per_club"))
+        for label, roster_after in [("Your team", my_after), ("Their team", their_after)]:
+            club_counts = {}
+            for r in roster_after:
+                cid = r.get("club_id", 0)
+                club_counts[cid] = club_counts.get(cid, 0) + 1
+            for cid, count in club_counts.items():
+                if cid and count > max_club:
+                    club_name = next((p.get("club_name", f"Club {cid}") for p in all_players.values() if p.get("club_id") == cid), f"Club {cid}")
+                    raise HTTPException(400, f"Trade would give {label} too many players from {club_name} ({count}/{max_club})")
+
+        db.execute(
+            "INSERT INTO trades (from_team_id, to_team_id) VALUES (?, ?)",
+            (my_team["id"], req.to_team_id),
+        )
+        trade_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        for pid in req.offering_player_ids:
+            db.execute("INSERT INTO trade_players (trade_id, player_id, from_team_id) VALUES (?, ?, ?)",
+                       (trade_id, pid, my_team["id"]))
+        for pid in req.requesting_player_ids:
+            db.execute("INSERT INTO trade_players (trade_id, player_id, from_team_id) VALUES (?, ?, ?)",
+                       (trade_id, pid, req.to_team_id))
+    return {"trade_id": trade_id, "status": "pending"}
+
+
+@app.get("/api/trades")
+async def list_trades(user=Depends(get_current_user)):
+    fpl_data = await get_fpl_data()
+    fpl_players = {p["id"]: p for p in parse_players(fpl_data)}
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        # Show all trades in review to everyone, plus own trades
+        trades = db.execute("""
+            SELECT t.*, ft.name as from_team_name, tt.name as to_team_name
+            FROM trades t
+            JOIN teams ft ON ft.id = t.from_team_id
+            JOIN teams tt ON tt.id = t.to_team_id
+            ORDER BY t.proposed_at DESC
+        """).fetchall()
+        result = [enrich_trade(db, t, fpl_players) for t in trades]
+        my_team_id = team["id"] if team else None
+    return {"trades": result, "my_team_id": my_team_id}
+
+
+@app.post("/api/trades/{trade_id}/accept")
+async def accept_trade(trade_id: int, user=Depends(get_current_user)):
+    """Accepting a trade moves it to 'in_review' with a review deadline."""
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        trade = db.execute("SELECT * FROM trades WHERE id=? AND status='pending'", (trade_id,)).fetchone()
+        if not trade:
+            raise HTTPException(404, "Trade not found or already resolved")
+        if trade["to_team_id"] != team["id"]:
+            raise HTTPException(403, "Only the receiving team can accept")
+
+        review_hours = int(get_config_val(db, "trade_review_period_hours") or "24")
+        expires = (datetime.now(timezone.utc) + timedelta(hours=review_hours)).isoformat()
+
+        db.execute(
+            "UPDATE trades SET status='in_review', accepted_at=datetime('now'), review_expires_at=? WHERE id=?",
+            (expires, trade_id),
+        )
+    return {"message": f"Trade accepted — now in {review_hours}h league review"}
+
+
+@app.post("/api/trades/{trade_id}/protest")
+def protest_trade(trade_id: int, user=Depends(get_current_user)):
+    """Any manager not involved in the trade can protest."""
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+        trade = db.execute("SELECT * FROM trades WHERE id=? AND status='in_review'", (trade_id,)).fetchone()
+        if not trade:
+            raise HTTPException(404, "Trade not found or not in review")
+        if team["id"] in (trade["from_team_id"], trade["to_team_id"]):
+            raise HTTPException(400, "You can't protest your own trade")
+
+        try:
+            db.execute("INSERT INTO trade_protests (trade_id, team_id) VALUES (?, ?)", (trade_id, team["id"]))
+        except Exception:
+            raise HTTPException(400, "You've already protested this trade")
+
+        # Check if threshold met
+        protests = db.execute("SELECT COUNT(*) as c FROM trade_protests WHERE trade_id=?", (trade_id,)).fetchone()["c"]
+        total_teams = db.execute("SELECT COUNT(*) as c FROM teams").fetchone()["c"]
+        eligible = max(total_teams - 2, 1)
+        threshold_pct = int(get_config_val(db, "trade_protest_threshold") or "50")
+        needed = max(1, int(eligible * threshold_pct / 100 + 0.5))
+
+        if protests >= needed:
+            db.execute("UPDATE trades SET status='vetoed', resolved_at=datetime('now') WHERE id=?", (trade_id,))
+            return {"message": "Trade vetoed by league vote", "vetoed": True}
+
+    return {"message": "Protest recorded", "vetoed": False}
+
+
+@app.post("/api/trades/{trade_id}/process")
+async def process_trade(trade_id: int, _=Depends(require_admin)):
+    """Admin: manually process a trade that's in review (skip waiting)."""
+    return await _execute_trade(trade_id)
+
+
+async def _execute_trade(trade_id: int):
+    """Execute the player swap for an approved trade."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        trade = db.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone()
+        if not trade or trade["status"] not in ("in_review", "pending"):
+            raise HTTPException(404, "Trade not found or already resolved")
+
+        trade_players_rows = db.execute("SELECT * FROM trade_players WHERE trade_id=?", (trade_id,)).fetchall()
+
+        # Pre-validate by simulating the swap (same logic as propose_trade)
+        from_roster = db.execute("SELECT player_id, position, salary, club_id FROM roster WHERE team_id=?",
+                                 (trade["from_team_id"],)).fetchall()
+        to_roster = db.execute("SELECT player_id, position, salary, club_id FROM roster WHERE team_id=?",
+                               (trade["to_team_id"],)).fetchall()
+
+        from_offering = [tp["player_id"] for tp in trade_players_rows if tp["from_team_id"] == trade["from_team_id"]]
+        to_offering = [tp["player_id"] for tp in trade_players_rows if tp["from_team_id"] == trade["to_team_id"]]
+
+        from_after = [dict(r) for r in from_roster if r["player_id"] not in from_offering]
+        to_after = [dict(r) for r in to_roster if r["player_id"] not in to_offering]
+
+        for pid in to_offering:
+            p = all_players.get(pid, {})
+            from_after.append({"player_id": pid, "position": p.get("position", "?"), "salary": p.get("salary", 0), "club_id": p.get("club_id", 0)})
+        for pid in from_offering:
+            p = all_players.get(pid, {})
+            to_after.append({"player_id": pid, "position": p.get("position", "?"), "salary": p.get("salary", 0), "club_id": p.get("club_id", 0)})
+
+        # Validate salary cap
+        cap = float(get_config_val(db, "salary_cap"))
+        for label, roster_after in [("From team", from_after), ("To team", to_after)]:
+            total = sum(r["salary"] for r in roster_after)
+            if total > cap:
+                raise Exception(f"{label} would exceed salary cap (£{total:.1f}m / £{cap:.1f}m)")
+
+        # Validate position limits
+        limits = {"GK": int(get_config_val(db, "max_gk")), "DEF": int(get_config_val(db, "max_def")),
+                  "MID": int(get_config_val(db, "max_mid")), "FWD": int(get_config_val(db, "max_fwd"))}
+        max_club = int(get_config_val(db, "max_per_club"))
+        for label, roster_after in [("From team", from_after), ("To team", to_after)]:
+            pos_counts = {}
+            club_counts = {}
+            for r in roster_after:
+                pos_counts[r["position"]] = pos_counts.get(r["position"], 0) + 1
+                cid = r.get("club_id", 0)
+                if cid: club_counts[cid] = club_counts.get(cid, 0) + 1
+            for pos, count in pos_counts.items():
+                if count > limits.get(pos, 99):
+                    raise Exception(f"{label} would have too many {pos}s ({count}/{limits[pos]})")
+            for cid, count in club_counts.items():
+                if count > max_club:
+                    raise Exception(f"{label} would exceed max players per club ({count}/{max_club})")
+
+        # Validation passed — execute the swap
+        for tp in trade_players_rows:
+            from_id = tp["from_team_id"]
+            to_id = trade["to_team_id"] if from_id == trade["from_team_id"] else trade["from_team_id"]
+            db.execute("UPDATE roster SET team_id=?, acquired_via='trade' WHERE team_id=? AND player_id=?",
+                       (to_id, from_id, tp["player_id"]))
+
+        db.execute("UPDATE trades SET status='completed', resolved_at=datetime('now') WHERE id=?", (trade_id,))
+    return {"message": "Trade completed"}
+
+
+@app.post("/api/trades/{trade_id}/reject")
+def reject_trade(trade_id: int, user=Depends(get_current_user)):
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        trade = db.execute("SELECT * FROM trades WHERE id=? AND status IN ('pending','in_review')", (trade_id,)).fetchone()
+        if not trade:
+            raise HTTPException(404, "Trade not found")
+        if trade["to_team_id"] != team["id"] and trade["from_team_id"] != team["id"] and not user.get("admin"):
+            raise HTTPException(403, "Cannot reject this trade")
+        db.execute("UPDATE trades SET status='rejected', resolved_at=datetime('now') WHERE id=?", (trade_id,))
+    return {"message": "Trade rejected"}
+
+
+# Auto-process trades past review period
+async def process_expired_reviews():
+    """Check for trades past their review period and execute them."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as db:
+        # Normalize timestamp comparison — handle both ISO and SQLite formats
+        expired = db.execute("""
+            SELECT id FROM trades
+            WHERE status='in_review' AND review_expires_at IS NOT NULL
+            AND REPLACE(REPLACE(review_expires_at, 'T', ' '), '+00:00', '') < ?
+        """, (now,)).fetchall()
+    for trade in expired:
+        try:
+            await _execute_trade(trade["id"])
+            logger.info(f"Auto-processed trade {trade['id']} after review period")
+        except Exception as e:
+            logger.error(f"Failed to auto-process trade {trade['id']}: {e}")
+            # Mark trade as failed so it doesn't stay stuck
+            with get_db() as db:
+                db.execute(
+                    "UPDATE trades SET status='failed', resolved_at=datetime('now') WHERE id=?",
+                    (trade["id"],)
+                )
+
+
+# ── Draft ───────────────────────────────────────────────────────────────
+@app.get("/api/draft")
+async def get_draft_state(user=Depends(get_current_user)):
+    with get_db() as db:
+        draft = db.execute("SELECT * FROM draft_state ORDER BY id DESC LIMIT 1").fetchone()
+        if not draft:
+            return {"status": "none"}
+        picks = db.execute("""
+            SELECT dp.*, t.name as team_name
+            FROM draft_picks dp
+            JOIN teams t ON t.id = dp.team_id
+            WHERE dp.draft_id = ?
+            ORDER BY dp.pick_number
+        """, (draft["id"],)).fetchall()
+
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    picked_ids = {p["player_id"] for p in picks}
+
+    # Also include all players currently on any roster
+    with get_db() as db:
+        rostered = db.execute("SELECT DISTINCT player_id FROM roster").fetchall()
+        rostered_ids = {r["player_id"] for r in rostered}
+    unavailable_ids = picked_ids | rostered_ids
+
+    enriched_picks = []
+    for p in picks:
+        player_info = all_players.get(p["player_id"], {})
+        enriched_picks.append({**dict(p), "player": player_info})
+
+    return {
+        **dict(draft),
+        "draft_order": json.loads(draft["draft_order"]) if draft["draft_order"] else [],
+        "picks": enriched_picks,
+        "picked_player_ids": list(unavailable_ids),
+    }
+
+
+@app.post("/api/draft/start")
+def start_draft(_=Depends(require_admin)):
+    with get_db() as db:
+        active = db.execute("SELECT id FROM draft_state WHERE status='active'").fetchone()
+        if active:
+            raise HTTPException(400, "Draft already in progress")
+        teams = db.execute("SELECT id FROM teams ORDER BY RANDOM()").fetchall()
+        if len(teams) < 2:
+            raise HTTPException(400, "Need at least 2 teams")
+        order = [t["id"] for t in teams]
+        db.execute(
+            "INSERT INTO draft_state (status, draft_order, started_at) VALUES ('active', ?, datetime('now'))",
+            (json.dumps(order),),
+        )
+    return {"message": "Draft started", "order": order}
+
+
+@app.post("/api/draft/pick")
+async def make_draft_pick(req: DraftPick, user=Depends(get_current_user)):
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    player = all_players.get(req.player_id)
+    if not player:
+        raise HTTPException(404, "Player not found")
+
+    with get_db() as db:
+        draft = db.execute("SELECT * FROM draft_state WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+        if not draft:
+            raise HTTPException(400, "No active draft")
+
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+
+        order = json.loads(draft["draft_order"])
+        pick_num = draft["current_pick"]
+        draft_type = get_config_val(db, "draft_type")
+        num_teams = len(order)
+        squad_size = int(get_config_val(db, "squad_size"))
+
+        # Snake draft logic
+        round_num = pick_num // num_teams
+        if draft_type == "snake" and round_num % 2 == 1:
+            idx = num_teams - 1 - (pick_num % num_teams)
+        else:
+            idx = pick_num % num_teams
+
+        if pick_num >= num_teams * squad_size:
+            raise HTTPException(400, "Draft is complete")
+        if order[idx] != team["id"]:
+            raise HTTPException(400, "Not your turn to pick")
+
+        # Check if player already picked
+        already = db.execute("SELECT id FROM draft_picks WHERE draft_id=? AND player_id=?",
+                             (draft["id"], req.player_id)).fetchone()
+        if already:
+            raise HTTPException(400, "Player already drafted")
+
+        # Validate roster
+        error = validate_roster(db, team["id"], adding_player=player)
+        if error:
+            raise HTTPException(400, error)
+
+        db.execute(
+            "INSERT INTO draft_picks (draft_id, team_id, player_id, pick_number, salary) VALUES (?, ?, ?, ?, ?)",
+            (draft["id"], team["id"], req.player_id, pick_num, player["salary"]),
+        )
+        db.execute(
+            "INSERT INTO roster (team_id, player_id, position, salary, club_id, acquired_via) VALUES (?, ?, ?, ?, ?, 'draft')",
+            (team["id"], player["id"], player["position"], player["salary"], player.get("club_id", 0)),
+        )
+
+        new_pick = pick_num + 1
+        if new_pick >= num_teams * squad_size:
+            db.execute("UPDATE draft_state SET current_pick=?, status='completed', completed_at=datetime('now') WHERE id=?",
+                       (new_pick, draft["id"]))
+        else:
+            db.execute("UPDATE draft_state SET current_pick=? WHERE id=?", (new_pick, draft["id"]))
+
+    return {"message": f"Drafted {player['web_name']}", "pick_number": pick_num}
+
+
+# ── How to Play ─────────────────────────────────────────────────────────
+class HowToPlaySection(BaseModel):
+    title: str
+    body: str
+    section_order: Optional[int] = 0
+
+
+@app.get("/api/how-to-play")
+def get_how_to_play():
+    with get_db() as db:
+        sections = db.execute("SELECT * FROM how_to_play ORDER BY section_order").fetchall()
+    return {"sections": [dict(s) for s in sections]}
+
+
+@app.post("/api/how-to-play")
+def add_how_to_play_section(req: HowToPlaySection, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO how_to_play (title, body, section_order) VALUES (?, ?, ?)",
+            (req.title, req.body, req.section_order)
+        )
+        sid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return {"id": sid, "message": "Section added"}
+
+
+@app.put("/api/how-to-play/{section_id}")
+def update_how_to_play_section(section_id: int, req: HowToPlaySection, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute(
+            "UPDATE how_to_play SET title=?, body=?, section_order=?, updated_at=datetime('now') WHERE id=?",
+            (req.title, req.body, req.section_order, section_id)
+        )
+    return {"message": "Section updated"}
+
+
+@app.delete("/api/how-to-play/{section_id}")
+def delete_how_to_play_section(section_id: int, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute("DELETE FROM how_to_play WHERE id=?", (section_id,))
+    return {"message": "Section deleted"}
+
+
+# ── Announcements ──────────────────────────────────────────────────────
+@app.get("/api/announcements")
+def get_announcements():
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT a.*, u.username as author_name
+            FROM announcements a JOIN users u ON u.id = a.author_id
+            ORDER BY a.created_at DESC LIMIT 20
+        """).fetchall()
+    return {"announcements": [dict(r) for r in rows]}
+
+
+@app.post("/api/announcements")
+def create_announcement(req: AnnouncementCreate, user=Depends(require_admin)):
+    with get_db() as db:
+        db.execute(
+            "INSERT INTO announcements (title, body, author_id) VALUES (?, ?, ?)",
+            (req.title, req.body, user["sub"]),
+        )
+        aid = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+    return {"id": aid, "message": "Announcement posted"}
+
+
+@app.put("/api/announcements/{ann_id}")
+def update_announcement(ann_id: int, req: AnnouncementUpdate, _=Depends(require_admin)):
+    with get_db() as db:
+        ann = db.execute("SELECT * FROM announcements WHERE id=?", (ann_id,)).fetchone()
+        if not ann:
+            raise HTTPException(404, "Announcement not found")
+        title = req.title if req.title is not None else ann["title"]
+        body = req.body if req.body is not None else ann["body"]
+        db.execute(
+            "UPDATE announcements SET title=?, body=?, updated_at=datetime('now') WHERE id=?",
+            (title, body, ann_id),
+        )
+    return {"message": "Announcement updated"}
+
+
+@app.delete("/api/announcements/{ann_id}")
+def delete_announcement(ann_id: int, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute("DELETE FROM announcements WHERE id=?", (ann_id,))
+    return {"message": "Announcement deleted"}
+
+
+# ── Admin endpoints ────────────────────────────────────────────────────
+
+
+# ── Notifications ──────────────────────────────────────────────────────
+@app.get("/api/notifications")
+async def get_notifications(user=Depends(get_current_user)):
+    """Generate notifications for the current user based on roster and trades."""
+    notifications = []
+
+    with get_db() as db:
+        team = db.execute("SELECT id, name FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            return {"notifications": []}
+
+        # Injury/news alerts for rostered players
+        roster = db.execute("SELECT player_id FROM roster WHERE team_id=?", (team["id"],)).fetchall()
+        roster_ids = {r["player_id"] for r in roster}
+
+        # Draft pick notifications
+        draft = db.execute("SELECT * FROM draft_state WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+        if draft:
+            order = json.loads(draft["draft_order"]) if draft["draft_order"] else []
+            num_teams = len(order)
+            current_pick = draft["current_pick"] or 0
+            draft_type = get_config_val(db, "draft_type") or "snake"
+            squad_size = int(get_config_val(db, "squad_size") or "15")
+
+            if current_pick < num_teams * squad_size and num_teams > 0:
+                # Determine current picker
+                round_num = current_pick // num_teams
+                if draft_type == "snake" and round_num % 2 == 1:
+                    idx = num_teams - 1 - (current_pick % num_teams)
+                else:
+                    idx = current_pick % num_teams
+                current_team_id = order[idx]
+
+                # Determine next picker
+                next_pick = current_pick + 1
+                next_team_id = None
+                if next_pick < num_teams * squad_size:
+                    next_round = next_pick // num_teams
+                    if draft_type == "snake" and next_round % 2 == 1:
+                        next_idx = num_teams - 1 - (next_pick % num_teams)
+                    else:
+                        next_idx = next_pick % num_teams
+                    next_team_id = order[next_idx]
+
+                if current_team_id == team["id"]:
+                    notifications.insert(0, {
+                        "type": "draft_your_pick",
+                        "icon": "🏈",
+                        "title": "You're On the Clock!",
+                        "message": f"It's your turn to pick (Pick #{current_pick + 1}, Round {round_num + 1})",
+                        "link": "/draft",
+                        "time": None,
+                    })
+                elif next_team_id == team["id"]:
+                    current_team_name = db.execute("SELECT name FROM teams WHERE id=?", (current_team_id,)).fetchone()
+                    notifications.insert(0, {
+                        "type": "draft_on_deck",
+                        "icon": "⏳",
+                        "title": "You're Up Next",
+                        "message": f"Waiting on {current_team_name['name'] if current_team_name else 'unknown'} — you pick next",
+                        "link": "/draft",
+                        "time": None,
+                    })
+
+        # Pending trades for this team
+        pending = db.execute("""
+            SELECT t.*, ft.name as from_team_name, tt.name as to_team_name
+            FROM trades t
+            JOIN teams ft ON ft.id = t.from_team_id
+            JOIN teams tt ON tt.id = t.to_team_id
+            WHERE t.status='pending' AND t.to_team_id=?
+        """, (team["id"],)).fetchall()
+        for t in pending:
+            notifications.append({
+                "type": "trade_pending",
+                "icon": "⇄",
+                "title": "Trade Proposal",
+                "message": f"{t['from_team_name']} wants to trade with you",
+                "link": "/trades",
+                "time": t["proposed_at"],
+            })
+
+        # Trades in review (for all managers to see)
+        in_review = db.execute("""
+            SELECT t.*, ft.name as from_team_name, tt.name as to_team_name
+            FROM trades t
+            JOIN teams ft ON ft.id = t.from_team_id
+            JOIN teams tt ON tt.id = t.to_team_id
+            WHERE t.status='in_review'
+        """).fetchall()
+        for t in in_review:
+            if t["from_team_id"] != team["id"] and t["to_team_id"] != team["id"]:
+                already_protested = db.execute(
+                    "SELECT id FROM trade_protests WHERE trade_id=? AND team_id=?",
+                    (t["id"], team["id"])
+                ).fetchone()
+                if not already_protested:
+                    notifications.append({
+                        "type": "trade_review",
+                        "icon": "👀",
+                        "title": "Trade Under Review",
+                        "message": f"{t['from_team_name']} ⇄ {t['to_team_name']} — you can protest",
+                        "link": "/trades",
+                        "time": t["accepted_at"],
+                    })
+
+    # Player injury/news
+    if roster_ids:
+        fpl_data = await get_fpl_data()
+        players = parse_players(fpl_data)
+        for p in players:
+            if p["id"] in roster_ids and p["status"] != "a" and p["injury_news"]:
+                notifications.append({
+                    "type": f"player_{p['status']}",
+                    "icon": "🏥" if p["status"] == "i" else "⚠️" if p["status"] == "d" else "🔴",
+                    "title": p["web_name"],
+                    "message": p["injury_news"],
+                    "link": "/team",
+                    "time": None,
+                })
+
+    return {"notifications": notifications}
+
+
+# ── League Scoring (all teams) ─────────────────────────────────────────
+@app.get("/api/scoring/week/{gameweek}")
+async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
+    """All teams' scores for a gameweek with player breakdowns."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username, COALESCE(SUM(r.salary), 0) as total_salary
+            FROM teams t JOIN users u ON t.user_id = u.id
+            LEFT JOIN roster r ON r.team_id = t.id
+            GROUP BY t.id
+        """).fetchall()
+
+        team_scores = []
+        for team in teams:
+            tid = team["id"]
+            team_salary = float(team["total_salary"])
+
+            # Get lineup with carry-forward
+            lineup = db.execute(
+                "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+                (tid, gameweek)
+            ).fetchall()
+            if not lineup:
+                prev = db.execute(
+                    "SELECT DISTINCT gameweek FROM lineups WHERE team_id=? AND gameweek<? ORDER BY gameweek DESC LIMIT 1",
+                    (tid, gameweek)
+                ).fetchone()
+                if prev:
+                    lineup = db.execute(
+                        "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+                        (tid, prev["gameweek"])
+                    ).fetchall()
+
+            lineup_map = {l["player_id"]: l["is_starter"] for l in lineup}
+            player_ids = [l["player_id"] for l in lineup]
+
+            # Get scores
+            gw_scores = {}
+            if player_ids:
+                placeholders = ",".join("?" * len(player_ids))
+                rows = db.execute(
+                    f"SELECT player_id, points, minutes, goals, assists, clean_sheets, bonus FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
+                    [gameweek] + player_ids
+                ).fetchall()
+                gw_scores = {r["player_id"]: dict(r) for r in rows}
+
+            players_detail = []
+            team_total = 0
+            for pid in player_ids:
+                p = all_players.get(pid, {"id": pid, "name": f"#{pid}", "web_name": f"#{pid}"})
+                s = gw_scores.get(pid, {})
+                is_starter = lineup_map.get(pid, 0)
+                pts = s.get("points", 0) if is_starter else 0
+                team_total += pts
+                players_detail.append({
+                    "id": pid,
+                    "name": p.get("name", f"#{pid}"),
+                    "web_name": p.get("web_name", f"#{pid}"),
+                    "position": p.get("position", "?"),
+                    "club_name": p.get("club_name", ""),
+                    "is_starter": bool(is_starter),
+                    "gw_points": s.get("points", 0),
+                    "counting_points": pts,
+                    "goals": s.get("goals", 0),
+                    "assists": s.get("assists", 0),
+                    "clean_sheets": s.get("clean_sheets", 0),
+                    "bonus": s.get("bonus", 0),
+                    "minutes": s.get("minutes", 0),
+                })
+            players_detail.sort(key=lambda x: (-x["is_starter"], -x["gw_points"]))
+
+            team_scores.append({
+                "team_id": tid,
+                "team_name": team["name"],
+                "manager": team["username"],
+                "weekly_points": team_total,
+                "total_salary": team_salary,
+                "players": players_detail,
+            })
+
+        team_scores.sort(key=lambda x: x["weekly_points"], reverse=True)
+
+    return {"gameweek": gameweek, "teams": team_scores}
+
+
+@app.get("/api/scoring/season")
+async def get_season_scoring(user=Depends(get_current_user)):
+    """Full season scoring breakdown: weekly scores per team + weekly high scores."""
+    fpl_data = await get_fpl_data()
+    events = fpl_data.get("events", [])
+    total_gws = len([e for e in events if e.get("finished") or e.get("is_current")])
+
+    with get_db() as db:
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username, COALESCE(SUM(r.salary), 0) as total_salary
+            FROM teams t JOIN users u ON t.user_id = u.id
+            LEFT JOIN roster r ON r.team_id = t.id
+            GROUP BY t.id
+        """).fetchall()
+
+        season = []
+        weekly_highs = {}  # gw -> {team_name, points}
+
+        for team in teams:
+            tid = team["id"]
+            team_salary = float(team["total_salary"])
+            weekly = db.execute(
+                "SELECT gameweek, weekly_points FROM team_gameweek_scores WHERE team_id=? ORDER BY gameweek",
+                (tid,)
+            ).fetchall()
+            weekly_dict = {w["gameweek"]: w["weekly_points"] for w in weekly}
+            total = sum(w["weekly_points"] for w in weekly)
+
+            # Track weekly highs
+            for w in weekly:
+                gw = w["gameweek"]
+                if gw not in weekly_highs or w["weekly_points"] > weekly_highs[gw]["points"]:
+                    weekly_highs[gw] = {"team_name": team["name"], "manager": team["username"], "points": w["weekly_points"]}
+
+            season.append({
+                "team_id": tid,
+                "team_name": team["name"],
+                "manager": team["username"],
+                "total_points": total,
+                "total_salary": team_salary,
+                "weekly_scores": weekly_dict,
+            })
+
+        season.sort(key=lambda x: x["total_points"], reverse=True)
+
+        # Payout projections
+        num_managers = len(teams)
+        entry_fee = float(get_config_val(db, "payout_entry_fee") or "0")
+        weekly_prize = float(get_config_val(db, "payout_weekly_prize") or "0")
+        pct_1st = float(get_config_val(db, "payout_1st_pct") or "0")
+        pct_2nd = float(get_config_val(db, "payout_2nd_pct") or "0")
+        pct_3rd = float(get_config_val(db, "payout_3rd_pct") or "0")
+
+    total_pot = entry_fee * num_managers
+    weekly_total = weekly_prize * total_gws
+    season_pool = total_pot - weekly_total
+
+    return {
+        "season": season,
+        "weekly_highs": weekly_highs,
+        "total_gameweeks": total_gws,
+        "payout": {
+            "entry_fee": entry_fee,
+            "num_managers": num_managers,
+            "total_pot": total_pot,
+            "weekly_prize": weekly_prize,
+            "weekly_total": weekly_total,
+            "season_pool": max(0, season_pool),
+            "first": max(0, season_pool) * pct_1st / 100,
+            "second": max(0, season_pool) * pct_2nd / 100,
+            "third": max(0, season_pool) * pct_3rd / 100,
+        },
+    }
+
+
+# ── Admin endpoints (continued) ───────────────────────────────────────
+@app.post("/api/admin/upload-logo")
+async def upload_logo(file: UploadFile = File(...), _=Depends(require_admin)):
+    """Upload a league logo image."""
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(400, "File must be an image")
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:  # 5MB limit
+        raise HTTPException(400, "Image must be under 5MB")
+    logo_path = os.path.join(os.path.dirname(DB_PATH) if "/" in DB_PATH else ".", LOGO_PATH)
+    with open(logo_path, "wb") as f:
+        f.write(contents)
+    return {"message": "Logo uploaded"}
+
+
+@app.get("/api/admin/users")
+def admin_list_users(_=Depends(require_admin)):
+    with get_db() as db:
+        users = db.execute("SELECT id, email, username, is_admin, is_active, has_paid, venmo, paypal, created_at FROM users").fetchall()
+    return {"users": [dict(u) for u in users]}
+
+
+@app.put("/api/admin/users/{user_id}/toggle-admin")
+def toggle_admin(user_id: int, _=Depends(require_admin)):
+    with get_db() as db:
+        u = db.execute("SELECT is_admin FROM users WHERE id=?", (user_id,)).fetchone()
+        if not u:
+            raise HTTPException(404, "User not found")
+        db.execute("UPDATE users SET is_admin=? WHERE id=?", (1 - u["is_admin"], user_id))
+    return {"message": "Admin status toggled"}
+
+
+@app.put("/api/admin/users/{user_id}/toggle-active")
+def toggle_active(user_id: int, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute("UPDATE users SET is_active = 1 - is_active WHERE id=?", (user_id,))
+    return {"message": "User status toggled"}
+
+
+@app.put("/api/admin/users/{user_id}/toggle-paid")
+def toggle_paid(user_id: int, _=Depends(require_admin)):
+    with get_db() as db:
+        db.execute("UPDATE users SET has_paid = 1 - COALESCE(has_paid, 0) WHERE id=?", (user_id,))
+    return {"message": "Payment status toggled"}
+
+
+@app.post("/api/admin/draft/reset")
+def reset_draft(_=Depends(require_admin)):
+    with get_db() as db:
+        season_id = get_active_season_id(db)
+        db.execute("DELETE FROM draft_picks WHERE draft_id IN (SELECT id FROM draft_state WHERE season_id=?)", (season_id,))
+        db.execute("DELETE FROM draft_state WHERE season_id=?", (season_id,))
+        db.execute("DELETE FROM roster WHERE acquired_via='draft' AND season_id=?", (season_id,))
+    return {"message": "Draft reset"}
+
+
+@app.post("/api/admin/refresh-all-scores")
+async def admin_refresh_all_scores(_=Depends(require_admin)):
+    """Refresh scores for all completed gameweeks."""
+    fpl_data = await get_fpl_data()
+    events = fpl_data.get("events", [])
+    refreshed = 0
+    for ev in events:
+        if ev.get("finished") or ev.get("is_current"):
+            await refresh_gameweek_scores(ev["id"])
+            refreshed += 1
+    return {"message": f"Refreshed {refreshed} gameweeks"}
+
+
+# ── Season Management ──────────────────────────────────────────────────
+@app.get("/api/seasons")
+def list_seasons(user=Depends(get_current_user)):
+    with get_db() as db:
+        seasons = db.execute("SELECT * FROM seasons ORDER BY id DESC").fetchall()
+    return {"seasons": [dict(s) for s in seasons]}
+
+
+@app.get("/api/seasons/active")
+def get_active_season(user=Depends(get_current_user)):
+    with get_db() as db:
+        season = db.execute("SELECT * FROM seasons WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+    return dict(season) if season else {"id": 1, "name": "2025/26", "status": "active"}
+
+
+@app.post("/api/admin/seasons/end")
+async def end_season(_=Depends(require_admin)):
+    """End the active season: snapshot players, archive everything."""
+    fpl_data = await get_fpl_data()
+    players = parse_players(fpl_data)
+
+    with get_db() as db:
+        season = db.execute("SELECT * FROM seasons WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+        if not season:
+            raise HTTPException(400, "No active season")
+        season_id = season["id"]
+
+        # Snapshot all players
+        for p in players:
+            db.execute("""
+                INSERT OR REPLACE INTO player_snapshot
+                (season_id, fpl_player_id, name, web_name, position, club_name, club_short, salary, total_points)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (season_id, p["id"], p["name"], p["web_name"], p["position"],
+                  p["club_name"], p["club"], p["salary"], p["total_points"]))
+
+        # Mark season as archived
+        db.execute("UPDATE seasons SET status='archived', ended_at=datetime('now') WHERE id=?", (season_id,))
+
+    return {"message": f"Season '{season['name']}' archived with {len(players)} player snapshots"}
+
+
+@app.post("/api/admin/seasons/start")
+def start_new_season(name: str = "2026/27", _=Depends(require_admin)):
+    """Start a new season: create season, clear active rosters/lineups/scores."""
+    with get_db() as db:
+        # Make sure no other season is active
+        db.execute("UPDATE seasons SET status='archived', ended_at=datetime('now') WHERE status='active'")
+
+        # Create new season
+        db.execute("INSERT INTO seasons (name, status) VALUES (?, 'active')", (name,))
+        new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        # Reset user payment status for new season
+        db.execute("UPDATE users SET has_paid=0")
+
+    return {"message": f"Season '{name}' started", "season_id": new_id}
+
+
+@app.get("/api/seasons/{season_id}/standings")
+async def get_season_standings(season_id: int, user=Depends(get_current_user)):
+    """Get standings for a specific (possibly archived) season."""
+    with get_db() as db:
+        season = db.execute("SELECT * FROM seasons WHERE id=?", (season_id,)).fetchone()
+        if not season:
+            raise HTTPException(404, "Season not found")
+
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username
+            FROM teams t JOIN users u ON t.user_id = u.id
+        """).fetchall()
+
+        standings = []
+        for team in teams:
+            weekly = db.execute(
+                "SELECT gameweek, weekly_points FROM team_gameweek_scores WHERE team_id=? AND season_id=? ORDER BY gameweek",
+                (team["id"], season_id)
+            ).fetchall()
+            weekly_dict = {w["gameweek"]: w["weekly_points"] for w in weekly}
+            total = sum(w["weekly_points"] for w in weekly)
+            standings.append({
+                "team_id": team["id"],
+                "team_name": team["name"],
+                "manager": team["username"],
+                "total_points": total,
+                "weekly_scores": weekly_dict,
+            })
+        standings.sort(key=lambda x: x["total_points"], reverse=True)
+
+    return {"season": dict(season), "standings": standings}
+
+
+@app.get("/api/free-agency/status")
+def get_free_agency_status(user=Depends(get_current_user)):
+    """Check if free agency window is currently open."""
+    with get_db() as db:
+        enabled = get_config_val(db, "free_agency_enabled") == "1"
+        if not enabled:
+            return {"enabled": False, "open": True, "message": "Free agency restrictions are off"}
+
+        day_start = int(get_config_val(db, "free_agency_day_start") or "2")
+        day_end = int(get_config_val(db, "free_agency_day_end") or "4")
+        hour_start = int(get_config_val(db, "free_agency_hour_start") or "10")
+        hour_end = int(get_config_val(db, "free_agency_hour_end") or "22")
+
+    import zoneinfo
+    try:
+        et = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+    except Exception:
+        et = datetime.now(timezone.utc) - timedelta(hours=4)
+    day = et.weekday()
+    hour = et.hour
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+    in_window = day_start <= day <= day_end
+    if in_window and day == day_start and hour < hour_start:
+        in_window = False
+    if in_window and day == day_end and hour >= hour_end:
+        in_window = False
+
+    return {
+        "enabled": True,
+        "open": in_window,
+        "window": f"{day_names[day_start]}-{day_names[day_end]}, {hour_start}:00-{hour_end}:00 ET",
+        "message": "Free agency is open" if in_window else f"Free agency opens {day_names[day_start]} at {hour_start}:00 ET",
+    }
+
+
+@app.get("/api/transactions")
+def get_transactions(user=Depends(get_current_user)):
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            return {"transactions": []}
+        txns = db.execute(
+            "SELECT * FROM transactions WHERE team_id=? ORDER BY created_at DESC LIMIT 50",
+            (team["id"],),
+        ).fetchall()
+    return {"transactions": [dict(t) for t in txns]}
+
+
+# ── FPL Live Gameweek Data ─────────────────────────────────────────────
+async def fetch_gw_live(gw: int) -> dict:
+    """Fetch live player scores for a specific gameweek."""
+    url = FPL_LIVE_URL.format(gw=gw)
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=30)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch GW {gw} live data: {e}")
+        return {}
+
+
+async def refresh_gameweek_scores(gw: int) -> dict:
+    """Fetch live scores for a GW and update the database, then recalculate team scores."""
+    live_data = await fetch_gw_live(gw)
+    if not live_data:
+        return {"updated": 0}
+
+    elements = live_data.get("elements", [])
+    updated = 0
+    with get_db() as db:
+        for el in elements:
+            pid = el["id"]
+            stats = el.get("stats", {})
+            points = stats.get("total_points", 0)
+            detail = json.dumps(stats)
+
+            db.execute("""
+                INSERT INTO gameweek_player_scores (gameweek, player_id, points, minutes, goals, assists, clean_sheets, bonus, detail, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(gameweek, player_id) DO UPDATE SET
+                    points=excluded.points, minutes=excluded.minutes, goals=excluded.goals,
+                    assists=excluded.assists, clean_sheets=excluded.clean_sheets, bonus=excluded.bonus,
+                    detail=excluded.detail, updated_at=datetime('now')
+            """, (
+                gw, pid, points,
+                stats.get("minutes", 0),
+                stats.get("goals_scored", 0),
+                stats.get("assists", 0),
+                stats.get("clean_sheets", 0),
+                stats.get("bonus", 0),
+                detail,
+            ))
+            updated += 1
+
+        # Recalculate team scores for this GW
+        teams = db.execute("SELECT id FROM teams").fetchall()
+        for team in teams:
+            tid = team["id"]
+            # Get starters for this GW (with carry-forward)
+            starters = db.execute(
+                "SELECT player_id FROM lineups WHERE team_id=? AND gameweek=? AND is_starter=1",
+                (tid, gw)
+            ).fetchall()
+            if not starters:
+                # Carry forward from most recent previous GW
+                prev = db.execute(
+                    "SELECT DISTINCT gameweek FROM lineups WHERE team_id=? AND gameweek<? ORDER BY gameweek DESC LIMIT 1",
+                    (tid, gw)
+                ).fetchone()
+                if prev:
+                    starters = db.execute(
+                        "SELECT player_id FROM lineups WHERE team_id=? AND gameweek=? AND is_starter=1",
+                        (tid, prev["gameweek"])
+                    ).fetchall()
+            starter_ids = [s["player_id"] for s in starters]
+
+            if starter_ids:
+                placeholders = ",".join("?" * len(starter_ids))
+                row = db.execute(
+                    f"SELECT COALESCE(SUM(points), 0) as total FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
+                    [gw] + starter_ids
+                ).fetchone()
+                weekly = row["total"]
+            else:
+                weekly = 0
+
+            db.execute("""
+                INSERT INTO team_gameweek_scores (team_id, gameweek, weekly_points, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(team_id, gameweek) DO UPDATE SET
+                    weekly_points=excluded.weekly_points, updated_at=datetime('now')
+            """, (tid, gw, weekly))
+
+    return {"updated": updated, "gameweek": gw}
+
+
+def get_current_gameweek_sync() -> Optional[int]:
+    """Synchronously determine the current/active gameweek from cached bootstrap data."""
+    if not os.path.exists(FPL_CACHE_FILE):
+        return None
+    with open(FPL_CACHE_FILE) as f:
+        data = json.load(f)
+    events = data.get("events", [])
+    for ev in events:
+        if ev.get("is_current"):
+            return ev["id"]
+    for ev in events:
+        if ev.get("is_next"):
+            return ev["id"]
+    return None
+
+
+# ── Lineup endpoints ───────────────────────────────────────────────────
+@app.post("/api/lineup")
+async def set_lineup(req: SetLineup, user=Depends(get_current_user)):
+    if len(req.starters) != 11:
+        raise HTTPException(400, "Must select exactly 11 starters")
+    if len(set(req.starters)) != 11:
+        raise HTTPException(400, "Duplicate players in lineup")
+
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        # Lineup lock check
+        lock_enabled = get_config_val(db, "lineup_lock_enabled") == "1"
+        if lock_enabled:
+            events = fpl_data.get("events", [])
+            for ev in events:
+                if ev["id"] == req.gameweek:
+                    deadline = ev.get("deadline_time")
+                    if deadline:
+                        from datetime import timezone as tz
+                        dl = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                        if datetime.now(tz.utc) > dl:
+                            raise HTTPException(400, f"GW{req.gameweek} deadline has passed. Lineups are locked.")
+                    break
+
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (int(user["sub"]),)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+
+        roster = db.execute("SELECT player_id FROM roster WHERE team_id=?", (team["id"],)).fetchall()
+        roster_ids = {r["player_id"] for r in roster}
+
+        # Validate all starters are on roster
+        for pid in req.starters:
+            if pid not in roster_ids:
+                raise HTTPException(400, f"Player {pid} is not on your roster")
+
+        # Validate formation: 1 GK, min DEF/MID/FWD
+        pos_counts = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
+        for pid in req.starters:
+            p = all_players.get(pid)
+            if p:
+                pos_counts[p["position"]] = pos_counts.get(p["position"], 0) + 1
+
+        if pos_counts["GK"] != 1:
+            raise HTTPException(400, "Must start exactly 1 GK")
+
+        min_def = int(get_config_val(db, "min_starting_def"))
+        min_mid = int(get_config_val(db, "min_starting_mid"))
+        min_fwd = int(get_config_val(db, "min_starting_fwd"))
+
+        if pos_counts["DEF"] < min_def:
+            raise HTTPException(400, f"Need at least {min_def} defenders")
+        if pos_counts["MID"] < min_mid:
+            raise HTTPException(400, f"Need at least {min_mid} midfielders")
+        if pos_counts["FWD"] < min_fwd:
+            raise HTTPException(400, f"Need at least {min_fwd} forwards")
+
+        # Clear and set lineup
+        db.execute("DELETE FROM lineups WHERE team_id=? AND gameweek=?", (team["id"], req.gameweek))
+        for pid in roster_ids:
+            db.execute(
+                "INSERT INTO lineups (team_id, gameweek, player_id, is_starter) VALUES (?, ?, ?, ?)",
+                (team["id"], req.gameweek, pid, 1 if pid in req.starters else 0)
+            )
+
+    return {"message": f"Lineup set for GW{req.gameweek}", "starters": req.starters}
+
+
+@app.get("/api/lineup/{gameweek}")
+async def get_lineup(gameweek: int, user=Depends(get_current_user)):
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (int(user["sub"]),)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+        rows = db.execute(
+            "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+            (team["id"], gameweek)
+        ).fetchall()
+
+        # Carry forward: if no lineup for this GW, use most recent previous
+        carried_from = None
+        if not rows:
+            prev = db.execute(
+                "SELECT DISTINCT gameweek FROM lineups WHERE team_id=? AND gameweek<? ORDER BY gameweek DESC LIMIT 1",
+                (team["id"], gameweek)
+            ).fetchone()
+            if prev:
+                carried_from = prev["gameweek"]
+                rows = db.execute(
+                    "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+                    (team["id"], carried_from)
+                ).fetchall()
+
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    starters = []
+    bench = []
+    for r in rows:
+        player = all_players.get(r["player_id"], {"id": r["player_id"], "web_name": f"#{r['player_id']}"})
+        if r["is_starter"]:
+            starters.append(player)
+        else:
+            bench.append(player)
+
+    return {"gameweek": gameweek, "starters": starters, "bench": bench, "carried_from": carried_from}
+
+
+# ── Scoring & Standings ────────────────────────────────────────────────
+@app.post("/api/scores/refresh")
+async def manual_refresh_scores(user=Depends(get_current_user)):
+    """Manual refresh of current gameweek scores."""
+    fpl_data = await get_fpl_data()
+    events = fpl_data.get("events", [])
+    current_gw = None
+    for ev in events:
+        if ev.get("is_current"):
+            current_gw = ev["id"]
+            break
+    if not current_gw:
+        for ev in events:
+            if ev.get("is_next"):
+                current_gw = ev["id"] - 1 if ev["id"] > 1 else 1
+                break
+    if not current_gw:
+        raise HTTPException(400, "Cannot determine current gameweek")
+
+    result = await refresh_gameweek_scores(current_gw)
+    return {"message": f"Scores refreshed for GW{current_gw}", **result}
+
+
+@app.post("/api/scores/refresh/{gameweek}")
+async def refresh_specific_gw(gameweek: int, _=Depends(require_admin)):
+    """Admin: refresh scores for a specific gameweek."""
+    result = await refresh_gameweek_scores(gameweek)
+    return {"message": f"Scores refreshed for GW{gameweek}", **result}
+
+
+@app.get("/api/standings")
+async def get_standings():
+    """League standings: weekly and cumulative scores for all teams."""
+    fpl_data = await get_fpl_data()
+    events = fpl_data.get("events", [])
+
+    # Find current GW
+    current_gw = 1
+    for ev in events:
+        if ev.get("is_current"):
+            current_gw = ev["id"]
+            break
+        if ev.get("is_next") and ev["id"] > 1:
+            current_gw = ev["id"] - 1
+            break
+
+    with get_db() as db:
+        teams = db.execute("""
+            SELECT t.id, t.name, u.username
+            FROM teams t JOIN users u ON t.user_id = u.id
+        """).fetchall()
+
+        standings = []
+        for team in teams:
+            # Get all weekly scores
+            weekly = db.execute(
+                "SELECT gameweek, weekly_points FROM team_gameweek_scores WHERE team_id=? ORDER BY gameweek",
+                (team["id"],)
+            ).fetchall()
+
+            weekly_dict = {w["gameweek"]: w["weekly_points"] for w in weekly}
+            total_points = sum(w["weekly_points"] for w in weekly)
+
+            # Current GW points
+            current_week_pts = weekly_dict.get(current_gw, 0)
+
+            standings.append({
+                "team_id": team["id"],
+                "team_name": team["name"],
+                "manager": team["username"],
+                "total_points": total_points,
+                "current_gw_points": current_week_pts,
+                "weekly_scores": weekly_dict,
+            })
+
+        # Sort by total points descending
+        standings.sort(key=lambda x: x["total_points"], reverse=True)
+
+    return {
+        "standings": standings,
+        "current_gameweek": current_gw,
+    }
+
+
+@app.get("/api/scores/{gameweek}/players")
+async def get_gw_player_scores(gameweek: int, user=Depends(get_current_user)):
+    """Get player-level scores for a gameweek, for the user's team."""
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (int(user["sub"]),)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+
+        # Get lineup (with carry-forward)
+        lineup = db.execute(
+            "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+            (team["id"], gameweek)
+        ).fetchall()
+        if not lineup:
+            prev = db.execute(
+                "SELECT DISTINCT gameweek FROM lineups WHERE team_id=? AND gameweek<? ORDER BY gameweek DESC LIMIT 1",
+                (team["id"], gameweek)
+            ).fetchone()
+            if prev:
+                lineup = db.execute(
+                    "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
+                    (team["id"], prev["gameweek"])
+                ).fetchall()
+
+        # Get scores
+        player_ids = [l["player_id"] for l in lineup]
+        if not player_ids:
+            return {"gameweek": gameweek, "players": [], "total": 0}
+
+        placeholders = ",".join("?" * len(player_ids))
+        scores = db.execute(
+            f"SELECT * FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
+            [gameweek] + player_ids
+        ).fetchall()
+        score_map = {s["player_id"]: dict(s) for s in scores}
+
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    lineup_map = {l["player_id"]: l["is_starter"] for l in lineup}
+    players = []
+    starter_total = 0
+    for pid in player_ids:
+        p = all_players.get(pid, {"id": pid, "name": f"#{pid}", "web_name": f"#{pid}"})
+        s = score_map.get(pid, {})
+        is_starter = lineup_map.get(pid, 0)
+        pts = s.get("points", 0) if is_starter else 0
+        starter_total += pts
+        players.append({
+            **p,
+            "gw_points": s.get("points", 0),
+            "counting_points": pts,
+            "is_starter": bool(is_starter),
+            "gw_minutes": s.get("minutes", 0),
+            "gw_goals": s.get("goals", 0),
+            "gw_assists": s.get("assists", 0),
+            "gw_clean_sheets": s.get("clean_sheets", 0),
+            "gw_bonus": s.get("bonus", 0),
+        })
+
+    # Sort: starters first, then by points
+    players.sort(key=lambda x: (-x["is_starter"], -x["gw_points"]))
+
+    return {"gameweek": gameweek, "players": players, "total": starter_total}
+
+
+# ── Background Score Refresh ───────────────────────────────────────────
+async def auto_refresh_scores():
+    """Background task: refresh scores and process expired trade reviews."""
+    try:
+        fpl_data = await get_fpl_data()
+        events = fpl_data.get("events", [])
+        current_gw = None
+        for ev in events:
+            if ev.get("is_current"):
+                current_gw = ev["id"]
+                break
+        if current_gw:
+            result = await refresh_gameweek_scores(current_gw)
+            logger.info(f"Auto-refresh GW{current_gw}: updated {result.get('updated', 0)} players")
+    except Exception as e:
+        logger.error(f"Auto-refresh failed: {e}")
+
+    # Process expired trade reviews
+    try:
+        await process_expired_reviews()
+    except Exception as e:
+        logger.error(f"Trade review processing failed: {e}")
+
+
+_scheduler_task = None
+
+async def score_scheduler():
+    """Run score refresh every hour."""
+    while True:
+        await asyncio.sleep(3600)  # 1 hour
+        await auto_refresh_scores()
