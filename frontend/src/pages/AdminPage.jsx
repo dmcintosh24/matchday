@@ -67,9 +67,10 @@ export default function AdminPage() {
     'Scoring – Goals': ['pts_goal_gk', 'pts_goal_def', 'pts_goal_mid', 'pts_goal_fwd'],
     'Scoring – Other': ['pts_assist', 'pts_clean_sheet_gk', 'pts_clean_sheet_def', 'pts_clean_sheet_mid', 'pts_save_per_3', 'pts_penalty_save', 'pts_defensive_contrib', 'def_contrib_threshold_def', 'def_contrib_threshold_mid_fwd'],
     'Scoring – Bonus': ['pts_bonus_1st', 'pts_bonus_2nd', 'pts_bonus_3rd'],
-    'League Settings': ['season_name', 'draft_type', 'trade_review_period_hours', 'trade_protest_threshold'],
-    'Free Agency': ['free_agency_enabled', 'free_agency_day_start', 'free_agency_day_end', 'free_agency_hour_start', 'free_agency_hour_end'],
+    'League Settings': ['season_name', 'draft_type', 'draft_timer_minutes', 'trade_review_period_hours', 'trade_protest_threshold'],
+    'Free Agency': ['free_agency_enabled', 'waiver_type', 'free_agency_day_start', 'free_agency_day_end', 'free_agency_hour_start', 'free_agency_hour_end'],
     'Lineup Lock': ['lineup_lock_enabled'],
+    'Notifications': ['notify_draft_pick', 'notify_trade_proposed', 'notify_lineup_reminder', 'notify_chat_message', 'notify_broadcast'],
     'Payouts': ['payout_entry_fee', 'payout_weekly_prize', 'payout_1st_pct', 'payout_2nd_pct', 'payout_3rd_pct', 'payout_venmo', 'payout_paypal'],
   };
 
@@ -169,6 +170,21 @@ export default function AdminPage() {
                         <button className={`btn btn-sm ${u.has_paid ? 'btn-danger' : 'btn-primary'}`} onClick={() => togglePaid(u.id)}>
                           {u.has_paid ? 'Mark Unpaid' : 'Mark Paid'}
                         </button>
+                        {!u.is_admin && (
+                          <button className="btn btn-sm btn-danger" onClick={async () => {
+                            if (!confirm(`Delete ${u.username}? This removes their roster and active data but preserves historical scores.`)) return;
+                            try {
+                              const token = localStorage.getItem('token');
+                              const res = await fetch(`/api/admin/users/${u.id}`, {
+                                method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` },
+                              });
+                              const data = await res.json();
+                              if (!res.ok) throw new Error(data.detail || 'Failed');
+                              setMsg({ text: data.message, type: 'success' });
+                              api.get('/admin/users').then(d => setUsers(d.users));
+                            } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+                          }}>Delete</button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -207,6 +223,37 @@ export default function AdminPage() {
               } catch (err) { setMsg({ text: err.message, type: 'error' }); }
             }}>Refresh All Gameweeks</button>
           </div>
+          <div className="card" style={{ marginTop: '1rem' }}>
+            <h3>Process Waivers</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1rem' }}>
+              Manually process all pending waiver claims in priority order. Normally runs automatically when the free agency window closes.
+            </p>
+            <button className="btn btn-primary" onClick={async () => {
+              try {
+                const token = localStorage.getItem('token');
+                const res = await fetch('/api/admin/waivers/process', {
+                  method: 'POST', headers: { 'Authorization': `Bearer ${token}` },
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Failed');
+                setMsg({ text: data.message, type: 'success' });
+              } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+            }}>Process Waivers Now</button>
+          </div>
+          <div className="card" style={{ marginTop: '1rem' }}>
+            <h3>Remove Player from All Teams</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1rem' }}>
+              Search for a player and remove them from whichever team has them. Also removes them from all lineups.
+            </p>
+            <AdminRemovePlayer setMsg={setMsg} />
+          </div>
+          <div className="card" style={{ marginTop: '1rem' }}>
+            <h3>Send Push Notification</h3>
+            <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1rem' }}>
+              Broadcast a push notification to all managers who have notifications enabled.
+            </p>
+            <AdminBroadcastPush setMsg={setMsg} />
+          </div>
         </div>
       )}
 
@@ -221,16 +268,29 @@ export default function AdminPage() {
               <button className="btn btn-danger" onClick={async () => {
                 if (!confirm('End the current season? This will archive all data and snapshot player records. This cannot be undone.')) return;
                 try {
-                  const res = await api.post('/admin/seasons/end');
-                  setMsg({ text: res.message, type: 'success' });
+                  const token = localStorage.getItem('token');
+                  const res = await fetch('/api/admin/seasons/end', {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` },
+                  });
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(data.detail || 'Failed');
+                  setMsg({ text: data.message, type: 'success' });
                 } catch (err) { setMsg({ text: err.message, type: 'error' }); }
               }}>End Current Season</button>
               <button className="btn btn-primary" onClick={async () => {
                 const name = prompt('Enter new season name (e.g. 2026/27):');
                 if (!name) return;
                 try {
-                  const res = await api.post(`/admin/seasons/start?name=${encodeURIComponent(name)}`);
-                  setMsg({ text: res.message, type: 'success' });
+                  const token = localStorage.getItem('token');
+                  const res = await fetch('/api/admin/seasons/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+                    body: JSON.stringify({ name }),
+                  });
+                  const data = await res.json();
+                  if (!res.ok) throw new Error(data.detail || 'Failed');
+                  setMsg({ text: data.message, type: 'success' });
                 } catch (err) { setMsg({ text: err.message, type: 'error' }); }
               }}>Start New Season</button>
             </div>
@@ -245,13 +305,122 @@ export default function AdminPage() {
   );
 }
 
+function AdminBroadcastPush({ setMsg }) {
+  const [title, setTitle] = useState('');
+  const [body, setBody] = useState('');
+  const [sending, setSending] = useState(false);
+
+  const send = async () => {
+    if (!title.trim() || !body.trim()) return;
+    setSending(true);
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/admin/push/broadcast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ title: title.trim(), message: body.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setMsg({ text: data.message, type: 'success' });
+      setTitle('');
+      setBody('');
+    } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+    setSending(false);
+  };
+
+  return (
+    <div>
+      <div className="form-group">
+        <label>Title</label>
+        <input value={title} onChange={e => setTitle(e.target.value)} placeholder="e.g., Draft Tonight!" />
+      </div>
+      <div className="form-group">
+        <label>Message</label>
+        <input value={body} onChange={e => setBody(e.target.value)} placeholder="e.g., Draft starts at 8pm ET — be there!" />
+      </div>
+      <button className="btn btn-primary" onClick={send} disabled={!title.trim() || !body.trim() || sending}>
+        {sending ? 'Sending...' : 'Send to All Managers'}
+      </button>
+    </div>
+  );
+}
+
+function AdminRemovePlayer({ setMsg }) {
+  const [search, setSearch] = useState('');
+  const [players, setPlayers] = useState([]);
+
+  const doSearch = async () => {
+    if (!search.trim()) return;
+    try {
+      const data = await api.get(`/players?search=${encodeURIComponent(search)}`);
+      setPlayers((data.players || []).filter(p => p.owner));
+    } catch { setPlayers([]); }
+  };
+
+  const remove = async (player) => {
+    if (!confirm(`Remove ${player.name} from ${player.owner}? This also removes them from all lineups.`)) return;
+    try {
+      const token = localStorage.getItem('token');
+      const res = await fetch('/api/admin/remove-player', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ player_id: player.id }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Failed');
+      setMsg({ text: data.message, type: 'success' });
+      setPlayers(prev => prev.filter(p => p.id !== player.id));
+    } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+  };
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem' }}>
+        <input placeholder="Search player name..." value={search}
+          onChange={e => setSearch(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && doSearch()}
+          style={{ flex: 1 }} />
+        <button className="btn btn-secondary" onClick={doSearch}>Search</button>
+      </div>
+      {players.length > 0 && (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Player</th><th>Club</th><th>Owner</th><th></th></tr></thead>
+            <tbody>
+              {players.map(p => (
+                <tr key={p.id}>
+                  <td style={{ fontWeight: 500 }}><span className={`pos pos-${p.position}`}>{p.position}</span> {p.name}</td>
+                  <td>{p.club_name}</td>
+                  <td style={{ color: 'var(--accent)' }}>{p.owner}</td>
+                  <td><button className="btn btn-sm btn-danger" onClick={() => remove(p)}>Remove</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {players.length === 0 && search && (
+        <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>No rostered players found matching "{search}"</p>
+      )}
+    </div>
+  );
+}
+
 function SeasonList() {
   const [seasons, setSeasons] = useState([]);
-  useEffect(() => { api.get('/seasons').then(d => setSeasons(d.seasons || [])).catch(() => {}); }, []);
+  const load = () => api.get('/seasons').then(d => setSeasons(d.seasons || [])).catch(() => {});
+  useEffect(() => { load(); }, []);
+  const deleteSeason = async (id, name) => {
+    if (!confirm(`Delete season "${name}"? This removes all archived data for this season.`)) return;
+    const token = localStorage.getItem('token');
+    await fetch(`/api/admin/seasons/${id}`, { method: 'DELETE', headers: { 'Authorization': `Bearer ${token}` } });
+    load();
+  };
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Season</th><th>Status</th><th>Created</th><th>Ended</th></tr></thead>
+        <thead><tr><th>Season</th><th>Status</th><th>Created</th><th>Ended</th><th></th></tr></thead>
         <tbody>
           {seasons.map(s => (
             <tr key={s.id}>
@@ -261,6 +430,11 @@ function SeasonList() {
               </td>
               <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{s.created_at?.slice(0, 10)}</td>
               <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{s.ended_at?.slice(0, 10) || '—'}</td>
+              <td>
+                {s.status === 'archived' && (
+                  <button className="btn btn-sm btn-danger" onClick={() => deleteSeason(s.id, s.name)}>Delete</button>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>

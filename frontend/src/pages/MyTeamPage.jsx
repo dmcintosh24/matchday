@@ -58,7 +58,9 @@ export default function MyTeamPage() {
     try {
       const res = await api.post('/teams/mine/drop', { player_id: playerId });
       setMsg({ text: res.message, type: 'success' });
-      load();
+      // Force fresh data reload
+      const fresh = await api.get(`/teams/mine?t=${Date.now()}`);
+      setData(fresh);
     } catch (err) { setMsg({ text: err.message, type: 'error' }); }
   };
 
@@ -83,6 +85,8 @@ export default function MyTeamPage() {
     } catch (err) { setMsg({ text: err.message, type: 'error' }); }
     setSavingLineup(false);
   };
+
+  const [showLogo, setShowLogo] = useState(false);
 
   if (!data) return <div><h1>My Team</h1><p style={{ color: 'var(--text-muted)' }}>Create a team from the Dashboard first.</p></div>;
 
@@ -109,7 +113,46 @@ export default function MyTeamPage() {
   return (
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-        <h1 style={{ margin: 0 }}>{data.team.name}</h1>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <div style={{ position: 'relative' }}>
+            <img src={`/api/teams/${data.team.id}/logo`} alt=""
+              style={{ width: 48, height: 48, borderRadius: 8, objectFit: 'contain', background: 'var(--bg-input)', cursor: 'pointer' }}
+              onClick={() => setShowLogo(true)}
+              onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'flex'; }} />
+            <div style={{ width: 48, height: 48, borderRadius: 8, background: 'var(--bg-input)', display: 'none',
+              alignItems: 'center', justifyContent: 'center', fontSize: '1.5rem' }}>⚽</div>
+            <label style={{
+              position: 'absolute', bottom: -4, right: -4, width: 20, height: 20, borderRadius: '50%',
+              background: 'var(--accent)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '0.6rem', cursor: 'pointer', border: '2px solid var(--bg)',
+            }} title="Upload team logo">
+              ✎
+              <input type="file" accept="image/*" style={{ display: 'none' }} onChange={async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const formData = new FormData();
+                formData.append('file', file);
+                const token = localStorage.getItem('token');
+                try {
+                  await fetch('/api/teams/mine/logo', {
+                    method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: formData,
+                  });
+                  setMsg({ text: 'Team logo updated!', type: 'success' });
+                  window.location.reload();
+                } catch { setMsg({ text: 'Upload failed', type: 'error' }); }
+              }} />
+            </label>
+          </div>
+          <h1 style={{ margin: 0 }}>{data.team.name}</h1>
+          <button className="btn btn-sm btn-secondary" onClick={async () => {
+            const newName = prompt('Enter new team name:', data.team.name);
+            if (!newName || newName === data.team.name) return;
+            try {
+              await api.put('/teams/mine/name', { name: newName });
+              load();
+            } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+          }} style={{ marginLeft: '0.5rem', padding: '0.2rem 0.5rem', fontSize: '0.7rem' }}>✎ Rename</button>
+        </div>
         <button className="btn btn-sm btn-secondary" onClick={refreshScores} disabled={refreshing}>
           {refreshing ? 'Refreshing...' : 'Refresh Scores'}
         </button>
@@ -402,6 +445,24 @@ export default function MyTeamPage() {
               </p>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Logo lightbox */}
+      {showLogo && (
+        <div onClick={() => setShowLogo(false)} style={{
+          position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 1000,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+        }}>
+          <div style={{ position: 'relative' }} onClick={e => e.stopPropagation()}>
+            <img src={`/api/teams/${data.team.id}/logo?t=${Date.now()}`} alt={data.team.name}
+              style={{ maxWidth: '80vw', maxHeight: '80vh', borderRadius: 12, objectFit: 'contain', background: '#fff', padding: '1rem' }} />
+            <button onClick={() => setShowLogo(false)} style={{
+              position: 'absolute', top: -12, right: -12, width: 32, height: 32, borderRadius: '50%',
+              background: 'var(--red)', color: '#fff', border: 'none', fontSize: '1rem',
+              cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}>✕</button>
+          </div>
         </div>
       )}
     </div>

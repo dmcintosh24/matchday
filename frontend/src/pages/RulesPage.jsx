@@ -174,22 +174,34 @@ export default function RulesPage() {
 
       {/* Free Agency & Lineup Lock */}
       <div className="card" style={{ marginBottom: '1.5rem' }}>
-        <h2>Free Agency</h2>
+        <h2>Free Agency & Waivers</h2>
         {val('free_agency_enabled') === '1' ? (
           <>
             <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '1rem' }}>
-              Player pickups are restricted to a weekly free agency window. Outside this window, you cannot add free agents to your roster.
+              Player pickups are restricted to a weekly free agency window.
             </p>
             <table>
               <tbody>
                 <tr><td style={{ fontWeight: 600 }}>Window</td><td>{['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][parseInt(val('free_agency_day_start'))] || '—'} through {['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'][parseInt(val('free_agency_day_end'))] || '—'}</td></tr>
                 <tr><td style={{ fontWeight: 600 }}>Hours</td><td>{val('free_agency_hour_start')}:00 — {val('free_agency_hour_end')}:00 ET</td></tr>
+                <tr><td style={{ fontWeight: 600 }}>Waiver Type</td><td>{val('waiver_type') === 'rolling' ? 'Rolling (inverse standings)' : 'First come, first serve'}</td></tr>
               </tbody>
             </table>
+            {val('waiver_type') === 'rolling' && (
+              <>
+                <h3 style={{ marginTop: '1.5rem' }}>Rolling Waivers</h3>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                  During the free agency window, managers submit waiver claims on players they want. When the window closes, claims are processed in waiver priority order — the team with the fewest total points gets first pick. This gives struggling teams a better shot at top free agents.
+                </p>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                  If multiple managers claim the same player, the one with the higher waiver priority (lower in standings) wins. You can view the current waiver order on the Players page.
+                </p>
+              </>
+            )}
           </>
         ) : (
           <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-            Free agency is currently unrestricted — players can be added at any time.
+            Free agency is currently unrestricted — players can be added at any time, first come first serve.
           </p>
         )}
 

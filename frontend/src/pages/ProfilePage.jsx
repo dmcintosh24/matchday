@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api/client';
+import { usePushNotifications } from '../api/usePush';
 
 export default function ProfilePage() {
   const [profile, setProfile] = useState(null);
@@ -91,6 +92,57 @@ export default function ProfilePage() {
           </button>
         </form>
       </div>
+
+      <PushSettings />
+    </div>
+  );
+}
+
+function PushSettings() {
+  const { supported, permission, subscribed, subscribe, unsubscribe, testPush } = usePushNotifications();
+  const [msg, setMsg] = useState('');
+
+  if (!supported) return (
+    <div className="card" style={{ maxWidth: 500, marginTop: '1rem' }}>
+      <h3>Push Notifications</h3>
+      <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+        Push notifications aren't supported in this browser. Try Chrome, Edge, or Firefox, or add the app to your home screen on mobile.
+      </p>
+    </div>
+  );
+
+  return (
+    <div className="card" style={{ maxWidth: 500, marginTop: '1rem' }}>
+      <h3>Push Notifications</h3>
+      <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '1rem' }}>
+        Get notified when it's your turn to draft, someone proposes a trade, or it's time to set your lineup.
+      </p>
+      {msg && <div className="alert alert-success" style={{ marginBottom: '0.75rem' }}>{msg}</div>}
+
+      {permission === 'denied' ? (
+        <p style={{ color: 'var(--red)', fontSize: '0.85rem' }}>
+          Notifications are blocked. Enable them in your browser settings for this site.
+        </p>
+      ) : subscribed ? (
+        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <span style={{ color: 'var(--green)', fontWeight: 600, fontSize: '0.85rem', alignSelf: 'center' }}>
+            ✓ Notifications enabled
+          </span>
+          <button className="btn btn-sm btn-secondary" onClick={async () => {
+            await testPush();
+            setMsg('Test notification sent!');
+            setTimeout(() => setMsg(''), 3000);
+          }}>Send Test</button>
+          <button className="btn btn-sm btn-danger" onClick={unsubscribe}>Disable</button>
+        </div>
+      ) : (
+        <button className="btn btn-primary" onClick={async () => {
+          const ok = await subscribe();
+          if (ok) setMsg('Notifications enabled!');
+          else setMsg('Could not enable notifications');
+          setTimeout(() => setMsg(''), 3000);
+        }}>Enable Notifications</button>
+      )}
     </div>
   );
 }

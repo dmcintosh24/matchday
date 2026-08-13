@@ -207,6 +207,9 @@ a.fotmob-link {
 }
 a.fotmob-link:hover { color: var(--accent); }
 
+/* Chat delete button */
+div:hover > .chat-delete-btn { display: flex !important; }
+
 /* Mobile header */
 .mobile-header {
   display: none; position: fixed; top: 0; left: 0; right: 0; height: 50px;

@@ -18,6 +18,8 @@ import HowToPlayPage from './pages/HowToPlayPage';
 import SchedulePage from './pages/SchedulePage';
 import ScoringPage from './pages/ScoringPage';
 import ProfilePage from './pages/ProfilePage';
+import TransactionsPage from './pages/TransactionsPage';
+import ChatPage from './pages/ChatPage';
 import AdminPage from './pages/AdminPage';
 
 function ProtectedRoute({ children }) {
@@ -90,6 +92,12 @@ function AppLayout({ children }) {
           <NavLink to="/rosters" className={({ isActive }) => isActive ? 'active' : ''} onClick={handleNav}>
             <span>All Rosters</span>
           </NavLink>
+          <NavLink to="/transactions" className={({ isActive }) => isActive ? 'active' : ''} onClick={handleNav}>
+            <span>Transactions</span>
+          </NavLink>
+          <NavLink to="/chat" className={({ isActive }) => isActive ? 'active' : ''} onClick={handleNav}>
+            <span>League Chat</span>
+          </NavLink>
           <NavLink to="/draft" className={({ isActive }) => isActive ? 'active' : ''} onClick={handleNav}>
             <span>Draft Board</span>
           </NavLink>
@@ -139,6 +147,8 @@ export default function App() {
       <Route path="/how-to-play" element={<ProtectedRoute><AppLayout><HowToPlayPage /></AppLayout></ProtectedRoute>} />
       <Route path="/profile" element={<ProtectedRoute><AppLayout><ProfilePage /></AppLayout></ProtectedRoute>} />
       <Route path="/rosters" element={<ProtectedRoute><AppLayout><RostersPage /></AppLayout></ProtectedRoute>} />
+      <Route path="/transactions" element={<ProtectedRoute><AppLayout><TransactionsPage /></AppLayout></ProtectedRoute>} />
+      <Route path="/chat" element={<ProtectedRoute><AppLayout><ChatPage /></AppLayout></ProtectedRoute>} />
       <Route path="/admin" element={<ProtectedRoute><AppLayout><AdminPage /></AppLayout></ProtectedRoute>} />
       <Route path="*" element={<Navigate to={league.setupComplete ? "/dashboard" : "/setup"} />} />
     </Routes>

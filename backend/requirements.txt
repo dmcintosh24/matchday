@@ -4,3 +4,5 @@ pyjwt
 httpx
 pydantic[email]
 python-multipart
+pywebpush
+cryptography

@@ -5,12 +5,17 @@ import { useFotMob } from '../api/useFotMob';
 
 export default function RostersPage() {
   const [data, setData] = useState([]);
+  const [missingTeams, setMissingTeams] = useState([]);
   const { PlayerLink, TeamLink } = useFotMob();
   const [loading, setLoading] = useState(true);
   const [expandedTeam, setExpandedTeam] = useState(null);
 
   useEffect(() => {
-    api.get('/teams/all-rosters').then(d => { setData(d.teams || []); setLoading(false); }).catch(() => setLoading(false));
+    api.get('/teams/all-rosters').then(d => {
+      setData(d.teams || []);
+      setMissingTeams(d.missing_teams || []);
+      setLoading(false);
+    }).catch(() => setLoading(false));
   }, []);
 
   if (loading) return <div><h1>Team Rosters</h1><p style={{ color: 'var(--text-muted)' }}>Loading...</p></div>;
@@ -37,8 +42,15 @@ export default function RostersPage() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
               onClick={() => setExpandedTeam(isExpanded ? null : team.id)}>
               <div>
-                <span style={{ fontWeight: 700, fontSize: '1.05rem' }}>{team.name}</span>
-                <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginLeft: '0.75rem' }}>{team.username}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                  <img src={`/api/teams/${team.id}/logo`} alt=""
+                    style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'contain', background: 'var(--bg-input)' }}
+                    onError={e => e.target.style.display = 'none'} />
+                  <div>
+                    <span style={{ fontWeight: 700, fontSize: '1.05rem' }}>{team.name}</span>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginLeft: '0.75rem' }}>{team.username}</span>
+                  </div>
+                </div>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
@@ -108,6 +120,25 @@ export default function RostersPage() {
           </div>
         );
       })}
+
+      {missingTeams.length > 0 && (
+        <div className="card" style={{ marginTop: '1rem', borderLeft: '3px solid var(--yellow)' }}>
+          <h3 style={{ marginBottom: '0.5rem' }}>⚠️ Managers Without Teams</h3>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem', marginBottom: '0.75rem' }}>
+            These managers are registered but haven't created a team yet.
+          </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+            {missingTeams.map(m => (
+              <span key={m.id} style={{
+                padding: '0.35rem 0.75rem', borderRadius: 'var(--radius)',
+                background: 'var(--bg-input)', fontSize: '0.85rem', fontWeight: 500,
+              }}>
+                {m.username}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

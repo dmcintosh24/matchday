@@ -246,7 +246,14 @@ export default function DashboardPage() {
               {standings?.standings?.length > 0 ? standings.standings.map((s, i) => (
                 <tr key={s.team_id}>
                   <td style={{ fontWeight: 700, color: i === 0 ? 'var(--accent)' : 'var(--text-muted)' }}>{i + 1}</td>
-                  <td style={{ fontWeight: 600 }}>{s.team_name}</td>
+                  <td>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                      <img src={`/api/teams/${s.team_id}/logo`} alt=""
+                        style={{ width: 22, height: 22, borderRadius: 4, objectFit: 'contain', background: 'var(--bg-input)' }}
+                        onError={e => e.target.style.display = 'none'} />
+                      <span style={{ fontWeight: 600 }}>{s.team_name}</span>
+                    </div>
+                  </td>
                   <td style={{ color: 'var(--text-muted)' }}>{s.manager}</td>
                   {gwColumns.map(gw => (
                     <td key={gw} style={{ textAlign: 'center' }}>{s.weekly_scores[gw] !== undefined ? s.weekly_scores[gw] : '—'}</td>

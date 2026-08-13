@@ -4,6 +4,60 @@ All notable changes to Matchday will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-08-13
+
+### Added
+- **Rolling Waivers** — inverse standings waiver system for free agency. Last place gets first pick at free agents. Managers submit claims during the window, processed in priority order when it closes.
+- **Draft Queue** — pre-rank players before the draft with drag-to-reorder and arrow buttons. Auto-draft picks from your queue when it's your turn.
+- **Auto-Draft** — toggle on to have the system pick for you automatically from your queue or best available.
+- **Draft Timer** — configurable countdown per pick (default 5 minutes). Auto-picks when time expires.
+- **Auto-Enable Auto-Draft** — after 3 missed picks (timer expires), auto-draft turns on automatically with a push notification.
+- **Draft Scorecard** — "Draft Grades" tab appears after draft completes with A-F grades, stats, and best/worst picks for every team.
+- **Draft Board Improvements** — round number display, roster composition bar (position counts + salary budget), full draft order sidebar, complete pick history, block unavailable/transferred players.
+- **PWA (Progressive Web App)** — installable on home screen, offline caching, standalone display mode.
+- **Push Notifications** — Web Push via VAPID keys for draft picks, trade proposals, lineup reminders, chat messages, and admin broadcasts.
+- **Admin Notification Controls** — toggle each notification type on/off league-wide.
+- **Admin Broadcast Push** — send custom push notifications to all managers from the admin panel.
+- **League Chat** — real-time in-app messaging with push notifications, delete own messages, admin moderation.
+- **Transaction History Page** — league-wide log of all adds, drops, drafts, trades, and waiver claims with team/action filters and pagination.
+- **Team Logo Upload** — managers upload team logos, displayed on My Team, All Rosters, Scoring, and Dashboard.
+- **Team Rename** — edit team name from My Team page.
+- **Logo Lightbox** — click team logo to view full size.
+- **Free Agent Filter** — filter Players page by All / Free Agents / Rostered.
+- **Admin Remove Player** — search and remove any player from any team.
+- **Admin Delete Past Seasons** — remove archived season data.
+- **Delete Users** — remove users without losing historical data (anonymizes record).
+- **Inactive Users Hidden** — disabled managers don't appear in draft, standings, scoring, or rosters.
+- **Missing Teams Indicator** — All Rosters page shows managers who haven't created a team yet.
+- **Waiver Priority Display** — endpoint showing current waiver order based on standings.
+- **Admin Process Waivers** — manual button to process pending waiver claims.
+- **Configurable Draft Timer** — set minutes per pick in Admin → League Settings.
+
+### Changed
+- App version bumped to 2.0.0
+- Draft board completely redesigned with queue tab, timer bar, and scorecard tab
+- Players page filters unavailable/transferred players by default
+- Trade proposals now pre-validate both teams for salary cap, position limits, and club limits
+- Trade auto-processor fixed with timestamp normalization
+- Failed trades marked as "failed" instead of stuck in review
+- FotMob search fixed to extract names from text|id format
+- FotMob links use correct apigw.fotmob.com endpoint
+- VAPID keys stored in persistent data directory
+- Start New Season properly clears all roster/lineup/trade/score data
+- API client only sends Content-Type header when body exists (Safari fix)
+- Draft picks reset pick_started_at for timer tracking
+- sqlite3.Row objects converted to dict before .get() calls
+
+### Fixed
+- Queue player names disappearing when position filter was active
+- Unavailable/transferred players could be drafted
+- Start New Season foreign key constraint error (deletion order)
+- "loadUsers" undefined error when deleting users
+- React hooks called after early return (error #310)
+- useFotMob.js needed .jsx extension for Vite
+- python-multipart missing for file uploads
+- Empty SECRET_KEY after rsync with --delete flag
+
 ## [1.1.0] - 2026-07-18
 
 ### Added

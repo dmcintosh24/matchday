@@ -100,7 +100,12 @@ export default function ScoringPage() {
                         color: i === 0 ? '#fff' : 'var(--text-muted)',
                       }}>{i + 1}</span>
                       <div>
-                        <span style={{ fontWeight: 600 }}>{t.team_name}</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <img src={`/api/teams/${t.team_id}/logo`} alt=""
+                            style={{ width: 24, height: 24, borderRadius: 4, objectFit: 'contain', background: 'var(--bg-input)' }}
+                            onError={e => e.target.style.display = 'none'} />
+                          <span style={{ fontWeight: 600 }}>{t.team_name}</span>
+                        </div>
                         <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginLeft: '0.5rem' }}>{t.manager}</span>
                       </div>
                     </div>

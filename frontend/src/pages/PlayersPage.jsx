@@ -9,6 +9,7 @@ export default function PlayersPage() {
   const [posFilter, setPosFilter] = useState('');
   const [clubFilter, setClubFilter] = useState('');
   const [gwFilter, setGwFilter] = useState('');
+  const [ownerFilter, setOwnerFilter] = useState('');
   const [showWishlist, setShowWishlist] = useState(false);
   const [wishlistIds, setWishlistIds] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -54,6 +55,16 @@ export default function PlayersPage() {
     } catch (err) { setMsg({ text: err.message, type: 'error' }); }
   };
 
+  const claimPlayer = async (player) => {
+    setMsg({ text: '', type: '' });
+    try {
+      const data = await api.post('/waivers/claim', { player_id: player.id });
+      setMsg({ text: data.message, type: 'success' });
+    } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+  };
+
+  const isWaivers = faStatus?.waiver_type === 'rolling' && faStatus?.enabled;
+
   const toggleWishlist = async (playerId) => {
     try {
       if (wishlistIds.has(playerId)) {
@@ -84,13 +95,18 @@ export default function PlayersPage() {
   };
 
   const filtered = useMemo(() => {
-    let list = [...players];
+    let list = [...players].filter(p => p.status !== 'u');
     if (search) {
       const s = search.toLowerCase();
       list = list.filter(p => p.name.toLowerCase().includes(s) || p.web_name.toLowerCase().includes(s));
     }
     if (showWishlist) {
       list = list.filter(p => wishlistIds.has(p.id));
+    }
+    if (ownerFilter === 'free') {
+      list = list.filter(p => !p.owner);
+    } else if (ownerFilter === 'taken') {
+      list = list.filter(p => p.owner);
     }
     list.sort((a, b) => {
       let aVal = a[sortCol], bVal = b[sortCol];
@@ -102,7 +118,7 @@ export default function PlayersPage() {
       return sortDir === 'asc' ? aVal - bVal : bVal - aVal;
     });
     return list;
-  }, [players, search, sortCol, sortDir, showWishlist, wishlistIds]);
+  }, [players, search, sortCol, sortDir, showWishlist, wishlistIds, ownerFilter]);
 
   const totalPages = Math.ceil(filtered.length / perPage);
   const paged = filtered.slice((page - 1) * perPage, page * perPage);
@@ -140,6 +156,11 @@ export default function PlayersPage() {
       {faStatus?.enabled && (
         <div className={`alert ${faStatus.open ? 'alert-success' : 'alert-error'}`} style={{ marginBottom: '1rem' }}>
           {faStatus.open ? '🟢 ' : '🔴 '}{faStatus.message}
+          {faStatus.waiver_type === 'rolling' && faStatus.open && (
+            <span style={{ display: 'block', fontSize: '0.8rem', marginTop: '0.25rem' }}>
+              📋 Rolling waivers active — claims are processed in inverse standings order when the window closes.
+            </span>
+          )}
           {!faStatus.open && <span style={{ display: 'block', fontSize: '0.8rem', marginTop: '0.25rem' }}>Window: {faStatus.window}</span>}
         </div>
       )}
@@ -192,6 +213,11 @@ export default function PlayersPage() {
           {gameweeks.filter(g => g.finished || g.is_current).map(g => (
             <option key={g.id} value={g.id}>GW{g.id}</option>
           ))}
+        </select>
+        <select value={ownerFilter} onChange={e => { setOwnerFilter(e.target.value); setPage(1); }}>
+          <option value="">All Players</option>
+          <option value="free">Free Agents</option>
+          <option value="taken">Rostered</option>
         </select>
       </div>
 
@@ -264,7 +290,11 @@ export default function PlayersPage() {
                     <span className={`status-${p.status}`}>{statusLabel(p.status)}</span>
                     {p.injury_news && <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block' }}>{p.injury_news}</span>}
                   </td>
-                  <td>{!p.owner && <button className="btn btn-sm btn-primary" onClick={() => addPlayer(p)}>Add</button>}</td>
+                  <td>{!p.owner && (
+                    isWaivers
+                      ? <button className="btn btn-sm btn-secondary" onClick={() => claimPlayer(p)}>Claim</button>
+                      : <button className="btn btn-sm btn-primary" onClick={() => addPlayer(p)}>Add</button>
+                  )}</td>
                 </tr>
               ))}
             </tbody>

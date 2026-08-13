@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 import jwt
+from cryptography.hazmat.primitives import serialization
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,8 +24,11 @@ from pydantic import BaseModel, EmailStr
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DB_PATH = os.getenv("DB_PATH", "fpl_league.db")
 LOGO_PATH = os.getenv("LOGO_PATH", "league_logo.png")
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 GITHUB_URL = "https://github.com/dmcintosh24/matchday"
+VAPID_PRIVATE_KEY_PATH = os.getenv("VAPID_PRIVATE_KEY_PATH", "vapid_private.pem")
+VAPID_PUBLIC_KEY_PATH = os.getenv("VAPID_PUBLIC_KEY_PATH", "vapid_public.pem")
+VAPID_CLAIMS_EMAIL = os.getenv("VAPID_EMAIL", "mailto:admin@matchday.app")
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 FPL_LIVE_URL = "https://fantasy.premierleague.com/api/event/{gw}/live/"
 FPL_CACHE_FILE = "fpl_cache.json"
@@ -247,6 +251,48 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            endpoint TEXT NOT NULL,
+            p256dh TEXT NOT NULL,
+            auth TEXT NOT NULL,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, endpoint)
+        );
+
+        CREATE TABLE IF NOT EXISTS draft_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            priority INTEGER DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            UNIQUE(user_id, player_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS waiver_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL,
+            player_id INTEGER NOT NULL,
+            drop_player_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            waiver_priority INTEGER DEFAULT 0,
+            processed_at TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        );
+
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             team_id INTEGER NOT NULL,
@@ -325,6 +371,7 @@ def init_db():
             "pts_bonus_3rd": ("1", "Bonus points - 3rd"),
             "season_name": ("2025/26", "Current season name"),
             "draft_type": ("snake", "Draft type: snake or linear"),
+            "draft_timer_minutes": ("5", "Minutes per draft pick before auto-pick"),
             "trade_review_period_hours": ("24", "Hours for league review after trade accepted"),
             "trade_protest_threshold": ("50", "Percent of other managers needed to block a trade"),
             "payout_entry_fee": ("50", "Entry fee per manager ($)"),
@@ -335,11 +382,17 @@ def init_db():
             "payout_venmo": ("", "Venmo handle for payments"),
             "payout_paypal": ("", "PayPal handle for payments"),
             "free_agency_enabled": ("0", "Enable free agency window (0=off, 1=on)"),
+            "waiver_type": ("rolling", "Waiver type: rolling (inverse standings), none (first come first serve)"),
             "free_agency_day_start": ("2", "Free agency window start day (0=Mon, 6=Sun)"),
             "free_agency_day_end": ("4", "Free agency window end day (0=Mon, 6=Sun)"),
             "free_agency_hour_start": ("10", "Free agency window start hour (24h ET)"),
             "free_agency_hour_end": ("22", "Free agency window end hour (24h ET)"),
             "lineup_lock_enabled": ("1", "Lock lineups after GW deadline (0=off, 1=on)"),
+            "notify_draft_pick": ("1", "Push notification when it's your turn to draft"),
+            "notify_trade_proposed": ("1", "Push notification when a trade is proposed to you"),
+            "notify_lineup_reminder": ("1", "Push notification to set lineup before deadline"),
+            "notify_chat_message": ("1", "Push notification for new chat messages"),
+            "notify_broadcast": ("1", "Push notification for admin broadcasts"),
         }
         for key, (value, desc) in defaults.items():
             db.execute(
@@ -363,6 +416,10 @@ def init_db():
             ("transactions", "season_id", "INTEGER DEFAULT 1"),
             ("wishlist", "season_id", "INTEGER DEFAULT 1"),
             ("gameweek_player_scores", "season_id", "INTEGER DEFAULT 1"),
+            ("draft_state", "pick_started_at", "TEXT"),
+            ("draft_state", "pick_timeout_minutes", "INTEGER DEFAULT 15"),
+            ("users", "auto_draft", "INTEGER DEFAULT 0"),
+            ("users", "missed_picks", "INTEGER DEFAULT 0"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -397,6 +454,85 @@ def get_active_season_id(db) -> int:
     """Get the active season ID."""
     row = db.execute("SELECT id FROM seasons WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
     return row["id"] if row else 1
+
+
+def ensure_vapid_keys():
+    """Generate VAPID keys if they don't exist."""
+    data_dir = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else "."
+    priv_path = os.path.join(data_dir, "vapid_private.pem")
+    pub_path = os.path.join(data_dir, "vapid_public.pem")
+    
+    if os.path.exists(priv_path) and os.path.exists(pub_path):
+        return
+    try:
+        from py_vapid import Vapid
+        vapid = Vapid()
+        vapid.generate_keys()
+        vapid.save_key(priv_path)
+        vapid.save_public_key(pub_path)
+        logger.info(f"Generated new VAPID keys in {data_dir}")
+    except Exception as e:
+        logger.error(f"Failed to generate VAPID keys: {e}")
+
+
+def get_vapid_public_key() -> str:
+    """Read the VAPID public key for client subscription."""
+    import base64
+    data_dir = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else "."
+    priv_path = os.path.join(data_dir, "vapid_private.pem")
+    try:
+        from py_vapid import Vapid
+        vapid = Vapid.from_file(priv_path)
+        raw = vapid.public_key.public_bytes(
+            serialization.Encoding.X962,
+            serialization.PublicFormat.UncompressedPoint
+        )
+        return base64.urlsafe_b64encode(raw).rstrip(b'=').decode()
+    except Exception as e:
+        logger.error(f"Failed to read VAPID public key: {e}")
+        return ""
+
+
+def send_push_notification(user_id: int, title: str, body: str, url: str = "/dashboard", notify_type: str = None):
+    """Send a push notification to all subscriptions for a user."""
+    try:
+        # Check if this notification type is enabled
+        if notify_type:
+            with get_db() as db:
+                enabled = get_config_val(db, f"notify_{notify_type}")
+                if enabled == "0":
+                    return
+
+        from pywebpush import webpush
+        data_dir = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else "."
+        priv_path = os.path.join(data_dir, "vapid_private.pem")
+        
+        with get_db() as db:
+            subs = db.execute("SELECT * FROM push_subscriptions WHERE user_id=?", (user_id,)).fetchall()
+        if not subs or not os.path.exists(priv_path):
+            logger.warning(f"Push skipped for user {user_id}: {'no subs' if not subs else 'no VAPID key'}")
+            return
+
+        payload = json.dumps({"title": title, "body": body, "url": url})
+        for sub in subs:
+            try:
+                webpush(
+                    subscription_info={
+                        "endpoint": sub["endpoint"],
+                        "keys": {"p256dh": sub["p256dh"], "auth": sub["auth"]},
+                    },
+                    data=payload,
+                    vapid_private_key=priv_path,
+                    vapid_claims={"sub": VAPID_CLAIMS_EMAIL},
+                )
+                logger.info(f"Push sent to user {user_id}")
+            except Exception as e:
+                if "410" in str(e) or "404" in str(e):
+                    with get_db() as db:
+                        db.execute("DELETE FROM push_subscriptions WHERE id=?", (sub["id"],))
+                logger.error(f"Push failed for user {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Push notification error: {e}")
 
 
 # ── Auth helpers ────────────────────────────────────────────────────────
@@ -535,7 +671,20 @@ class ConfigUpdate(BaseModel):
 
 class SetLineup(BaseModel):
     gameweek: int
-    starters: list[int]  # list of player_ids (exactly 11)
+    starters: list[int]
+
+class SeasonStart(BaseModel):
+    name: str = "2026/27"
+
+class ChatMessage(BaseModel):
+    message: str
+
+class DraftQueueUpdate(BaseModel):
+    player_ids: list[int]  # ordered list of player IDs
+
+class WaiverClaim(BaseModel):
+    player_id: int
+    drop_player_id: int = None  # optional player to drop to make room  # list of player_ids (exactly 11)
 
 class AnnouncementCreate(BaseModel):
     title: str
@@ -557,8 +706,10 @@ class ProfileUpdate(BaseModel):
 @app.on_event("startup")
 async def startup():
     init_db()
+    ensure_vapid_keys()
     global _scheduler_task
     _scheduler_task = asyncio.create_task(score_scheduler())
+    asyncio.create_task(hourly_scheduler())
     asyncio.create_task(backfill_club_ids())
     logger.info("Score auto-refresh scheduler started (hourly)")
 
@@ -814,11 +965,13 @@ async def fotmob_search(term: str) -> list:
             players = []
             for section in data if isinstance(data, list) else [data]:
                 if isinstance(section, dict):
-                    # Format: squadMemberSuggest[].options[].payload
                     for suggest in section.get("squadMemberSuggest", []):
                         for option in suggest.get("options", []):
-                            payload = option.get("payload", option)
+                            payload = option.get("payload", {})
+                            text = option.get("text", "")
+                            name = text.split("|")[0].strip() if "|" in text else text
                             if payload.get("id"):
+                                payload["name"] = name
                                 players.append(payload)
             return players
     except Exception as e:
@@ -842,8 +995,11 @@ async def fotmob_search_teams(term: str) -> list:
                 if isinstance(section, dict):
                     for suggest in section.get("teamSuggest", []):
                         for option in suggest.get("options", []):
-                            payload = option.get("payload", option)
+                            payload = option.get("payload", {})
+                            text = option.get("text", "")
+                            name = text.split("|")[0].strip() if "|" in text else text
                             if payload.get("id"):
+                                payload["name"] = name
                                 teams.append(payload)
             return teams
     except Exception as e:
@@ -1128,6 +1284,56 @@ def create_team(req: TeamCreate, user=Depends(get_current_user)):
     return {"id": team_id, "name": req.name}
 
 
+@app.put("/api/teams/mine/name")
+def rename_team(req: TeamCreate, user=Depends(get_current_user)):
+    """Rename your team."""
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+        db.execute("UPDATE teams SET name=? WHERE id=?", (req.name, team["id"]))
+    return {"message": f"Team renamed to {req.name}"}
+
+
+@app.post("/api/teams/mine/logo")
+async def upload_team_logo(file: UploadFile = File(...), user=Depends(get_current_user)):
+    """Upload a team logo."""
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(400, "File must be an image")
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Image must be under 5MB")
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+    data_dir = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else "."
+    logo_dir = os.path.join(data_dir, "team_logos")
+    os.makedirs(logo_dir, exist_ok=True)
+    ext = file.filename.rsplit(".", 1)[-1] if "." in file.filename else "png"
+    path = os.path.join(logo_dir, f"team_{team['id']}.{ext}")
+    # Remove old logo with different extension
+    for old in os.listdir(logo_dir):
+        if old.startswith(f"team_{team['id']}."):
+            os.remove(os.path.join(logo_dir, old))
+    with open(path, "wb") as f:
+        f.write(contents)
+    return {"message": "Team logo uploaded"}
+
+
+@app.get("/api/teams/{team_id}/logo")
+async def get_team_logo(team_id: int):
+    """Serve a team's logo."""
+    from fastapi.responses import FileResponse
+    data_dir = os.path.dirname(os.path.abspath(DB_PATH)) if os.path.dirname(DB_PATH) else "."
+    logo_dir = os.path.join(data_dir, "team_logos")
+    if os.path.exists(logo_dir):
+        for fname in os.listdir(logo_dir):
+            if fname.startswith(f"team_{team_id}."):
+                return FileResponse(os.path.join(logo_dir, fname))
+    raise HTTPException(404, "No team logo")
+
+
 @app.get("/api/teams")
 def list_teams(user=Depends(get_current_user)):
     with get_db() as db:
@@ -1138,6 +1344,7 @@ def list_teams(user=Depends(get_current_user)):
             FROM teams t
             JOIN users u ON t.user_id = u.id
             LEFT JOIN roster r ON r.team_id = t.id
+            WHERE u.is_active = 1
             GROUP BY t.id
         """).fetchall()
     return {"teams": [dict(t) for t in teams]}
@@ -1178,8 +1385,18 @@ async def add_player_to_team(req: AddPlayer, user=Depends(get_current_user)):
         raise HTTPException(404, "Player not found")
 
     with get_db() as db:
-        # Free agency window check
+        # Check if draft has been completed
+        draft = db.execute("SELECT status FROM draft_state ORDER BY id DESC LIMIT 1").fetchone()
+        if not draft or draft["status"] != "completed":
+            raise HTTPException(400, "Free agent pickups are locked until the draft is complete")
+
+        # Check if rolling waivers are active
+        waiver_type = get_config_val(db, "waiver_type") or "none"
         fa_enabled = get_config_val(db, "free_agency_enabled") == "1"
+        if waiver_type == "rolling" and fa_enabled:
+            raise HTTPException(400, "Rolling waivers are active — submit a waiver claim instead of adding directly")
+
+        # Free agency window check
         if fa_enabled:
             from datetime import timezone as tz
             now = datetime.now(tz.utc)
@@ -1283,6 +1500,7 @@ async def get_all_rosters(user=Depends(get_current_user)):
             FROM teams t
             JOIN users u ON t.user_id = u.id
             LEFT JOIN roster r ON r.team_id = t.id
+            WHERE u.is_active = 1
             GROUP BY t.id
         """).fetchall()
 
@@ -1298,7 +1516,15 @@ async def get_all_rosters(user=Depends(get_current_user)):
                 "team": dict(team),
                 "roster": enriched,
             })
-    return {"teams": result}
+
+        # Find active users without teams
+        missing = db.execute("""
+            SELECT u.id, u.username FROM users u
+            WHERE u.is_active = 1
+            AND u.id NOT IN (SELECT user_id FROM teams)
+        """).fetchall()
+
+    return {"teams": result, "missing_teams": [dict(m) for m in missing]}
 
 
 def enrich_trade(db, trade, fpl_players):
@@ -1433,6 +1659,20 @@ async def propose_trade(req: TradeProposal, user=Depends(get_current_user)):
         for pid in req.requesting_player_ids:
             db.execute("INSERT INTO trade_players (trade_id, player_id, from_team_id) VALUES (?, ?, ?)",
                        (trade_id, pid, req.to_team_id))
+
+        # Notify the target manager
+        target_user = db.execute("SELECT user_id FROM teams WHERE id=?", (req.to_team_id,)).fetchone()
+        my_team_name = db.execute("SELECT name FROM teams WHERE id=?", (my_team["id"],)).fetchone()
+
+    if target_user:
+        send_push_notification(
+            target_user["user_id"],
+            "Trade Proposal ⇄",
+            f"{my_team_name['name'] if my_team_name else 'A manager'} wants to trade with you",
+            "/trades",
+            notify_type="trade_proposed"
+        )
+
     return {"trade_id": trade_id, "status": "pending"}
 
 
@@ -1649,11 +1889,31 @@ async def get_draft_state(user=Depends(get_current_user)):
         player_info = all_players.get(p["player_id"], {})
         enriched_picks.append({**dict(p), "player": player_info})
 
+    # Timer info
+    draft_dict = dict(draft)
+    pick_started = draft_dict.get("pick_started_at")
+    timeout = draft_dict.get("pick_timeout_minutes") or 15
+    time_remaining = None
+    if pick_started and draft["status"] == "active":
+        try:
+            started = datetime.fromisoformat(pick_started.replace("Z", "+00:00")) if "T" in pick_started else datetime.strptime(pick_started, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            time_remaining = max(0, timeout * 60 - elapsed)
+        except Exception:
+            time_remaining = timeout * 60
+
+    # Get user's auto-draft status
+    with get_db() as db:
+        user_ad = db.execute("SELECT auto_draft FROM users WHERE id=?", (user["sub"],)).fetchone()
+
     return {
         **dict(draft),
         "draft_order": json.loads(draft["draft_order"]) if draft["draft_order"] else [],
         "picks": enriched_picks,
         "picked_player_ids": list(unavailable_ids),
+        "time_remaining_seconds": time_remaining,
+        "pick_timeout_minutes": timeout,
+        "auto_draft": bool(user_ad["auto_draft"]) if user_ad else False,
     }
 
 
@@ -1663,14 +1923,16 @@ def start_draft(_=Depends(require_admin)):
         active = db.execute("SELECT id FROM draft_state WHERE status='active'").fetchone()
         if active:
             raise HTTPException(400, "Draft already in progress")
-        teams = db.execute("SELECT id FROM teams ORDER BY RANDOM()").fetchall()
+        teams = db.execute("SELECT t.id FROM teams t JOIN users u ON t.user_id = u.id WHERE u.is_active = 1 ORDER BY RANDOM()").fetchall()
         if len(teams) < 2:
             raise HTTPException(400, "Need at least 2 teams")
         order = [t["id"] for t in teams]
         db.execute(
-            "INSERT INTO draft_state (status, draft_order, started_at) VALUES ('active', ?, datetime('now'))",
-            (json.dumps(order),),
+            "INSERT INTO draft_state (status, draft_order, started_at, pick_started_at, pick_timeout_minutes) VALUES ('active', ?, datetime('now'), datetime('now'), ?)",
+            (json.dumps(order), int(get_config_val(db, "draft_timer_minutes") or "5")),
         )
+        # Reset missed picks and auto-draft for all users
+        db.execute("UPDATE users SET missed_picks=0, auto_draft=0")
     return {"message": "Draft started", "order": order}
 
 
@@ -1681,6 +1943,8 @@ async def make_draft_pick(req: DraftPick, user=Depends(get_current_user)):
     player = all_players.get(req.player_id)
     if not player:
         raise HTTPException(404, "Player not found")
+    if player.get("status") == "u":
+        raise HTTPException(400, f"{player['name']} is unavailable (transferred or not in the league)")
 
     with get_db() as db:
         draft = db.execute("SELECT * FROM draft_state WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
@@ -1731,12 +1995,387 @@ async def make_draft_pick(req: DraftPick, user=Depends(get_current_user)):
 
         new_pick = pick_num + 1
         if new_pick >= num_teams * squad_size:
-            db.execute("UPDATE draft_state SET current_pick=?, status='completed', completed_at=datetime('now') WHERE id=?",
+            db.execute("UPDATE draft_state SET current_pick=?, pick_started_at=NULL, status='completed', completed_at=datetime('now') WHERE id=?",
                        (new_pick, draft["id"]))
         else:
-            db.execute("UPDATE draft_state SET current_pick=? WHERE id=?", (new_pick, draft["id"]))
+            db.execute("UPDATE draft_state SET current_pick=?, pick_started_at=datetime('now') WHERE id=?", (new_pick, draft["id"]))
+
+            # Notify next picker
+            next_round = new_pick // num_teams
+            draft_type = get_config_val(db, "draft_type") or "snake"
+            if draft_type == "snake" and next_round % 2 == 1:
+                next_idx = num_teams - 1 - (new_pick % num_teams)
+            else:
+                next_idx = new_pick % num_teams
+            next_team_id = order[next_idx]
+            next_user = db.execute("SELECT user_id FROM teams WHERE id=?", (next_team_id,)).fetchone()
+            if next_user:
+                send_push_notification(
+                    next_user["user_id"],
+                    "You're On the Clock! 🏈",
+                    f"It's your turn to draft (Pick #{new_pick + 1})",
+                    "/draft",
+                    notify_type="draft_pick"
+                )
+
+        # Reset missed picks counter since they picked manually
+        db.execute("UPDATE users SET missed_picks=0 WHERE id=?", (user["sub"],))
 
     return {"message": f"Drafted {player['web_name']}", "pick_number": pick_num}
+
+
+# ── Draft Scorecard ─────────────────────────────────────────────────────
+@app.get("/api/draft/scorecard")
+async def get_draft_scorecard(user=Depends(get_current_user)):
+    """Generate draft grades for all teams."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        draft = db.execute("SELECT * FROM draft_state ORDER BY id DESC LIMIT 1").fetchone()
+        if not draft:
+            return {"scorecard": [], "status": "none"}
+
+        picks = db.execute("""
+            SELECT dp.pick_number, dp.team_id, dp.player_id, dp.salary, t.name as team_name
+            FROM draft_picks dp JOIN teams t ON t.id = dp.team_id
+            ORDER BY dp.pick_number
+        """).fetchall()
+
+    # Group by team
+    team_picks = {}
+    for p in picks:
+        tid = p["team_id"]
+        if tid not in team_picks:
+            team_picks[tid] = {"name": p["team_name"], "picks": []}
+        player = all_players.get(p["player_id"], {})
+        team_picks[tid]["picks"].append({
+            "pick_number": p["pick_number"] + 1,
+            "player_name": player.get("name", f"#{p['player_id']}"),
+            "position": player.get("position", "?"),
+            "salary": p["salary"],
+            "total_points": player.get("total_points", 0),
+            "club_name": player.get("club_name", ""),
+            "status": player.get("status", "a"),
+        })
+
+    # Grade each team
+    scorecard = []
+    for tid, t in team_picks.items():
+        total_pts = sum(p["total_points"] for p in t["picks"])
+        total_sal = sum(p["salary"] for p in t["picks"])
+        avg = total_pts / len(t["picks"]) if t["picks"] else 0
+        vpm = total_pts / total_sal if total_sal > 0 else 0
+        zeros = sum(1 for p in t["picks"] if p["total_points"] == 0)
+
+        pos_counts = {}
+        for p in t["picks"]:
+            pos_counts[p["position"]] = pos_counts.get(p["position"], 0) + 1
+
+        # Calculate grade score
+        score = 0
+        score += min(total_pts / 1900 * 40, 40)
+        score += min(vpm / 22 * 30, 30)
+        bal = 1 if (pos_counts.get("GK", 0) >= 1 and pos_counts.get("DEF", 0) >= 3 and
+                     pos_counts.get("MID", 0) >= 3 and pos_counts.get("FWD", 0) >= 2) else 0.7
+        score += bal * 15
+        score -= zeros * 5
+        score += 10 if avg > 100 else (5 if avg > 80 else 0)
+        score = max(0, min(100, score))
+
+        if score >= 85: grade = "A"
+        elif score >= 70: grade = "B+"
+        elif score >= 60: grade = "B"
+        elif score >= 50: grade = "C+"
+        elif score >= 40: grade = "C"
+        elif score >= 30: grade = "D"
+        else: grade = "F"
+
+        best = max(t["picks"], key=lambda p: p["total_points"])
+        worst = min(t["picks"], key=lambda p: p["total_points"])
+        best_value = max(t["picks"], key=lambda p: p["total_points"] / p["salary"] if p["salary"] > 0 else 0)
+
+        scorecard.append({
+            "team_id": tid,
+            "team_name": t["name"],
+            "grade": grade,
+            "score": round(score),
+            "total_points": total_pts,
+            "total_salary": round(total_sal, 1),
+            "avg_per_player": round(avg),
+            "pts_per_million": round(vpm, 1),
+            "position_counts": pos_counts,
+            "zeros": zeros,
+            "best_pick": best,
+            "worst_pick": worst,
+            "best_value": best_value,
+            "picks": t["picks"],
+        })
+
+    scorecard.sort(key=lambda x: x["total_points"], reverse=True)
+    return {"scorecard": scorecard, "status": dict(draft)["status"]}
+
+
+# ── Draft Queue & Auto-Draft ────────────────────────────────────────────
+@app.get("/api/draft/queue")
+def get_draft_queue(user=Depends(get_current_user)):
+    """Get current user's draft queue."""
+    with get_db() as db:
+        rows = db.execute(
+            "SELECT player_id, priority FROM draft_queue WHERE user_id=? ORDER BY priority",
+            (user["sub"],)
+        ).fetchall()
+    return {"queue": [{"player_id": r["player_id"], "priority": r["priority"]} for r in rows]}
+
+
+@app.put("/api/draft/queue")
+def update_draft_queue(req: DraftQueueUpdate, user=Depends(get_current_user)):
+    """Set the user's draft queue (ordered list of player IDs)."""
+    with get_db() as db:
+        db.execute("DELETE FROM draft_queue WHERE user_id=?", (user["sub"],))
+        for i, pid in enumerate(req.player_ids):
+            db.execute(
+                "INSERT INTO draft_queue (user_id, player_id, priority) VALUES (?, ?, ?)",
+                (user["sub"], pid, i)
+            )
+    return {"message": f"Queue updated with {len(req.player_ids)} players"}
+
+
+@app.post("/api/draft/queue/add")
+def add_to_draft_queue(req: AddPlayer, user=Depends(get_current_user)):
+    """Add a player to the end of the draft queue."""
+    with get_db() as db:
+        max_pri = db.execute(
+            "SELECT COALESCE(MAX(priority), -1) as m FROM draft_queue WHERE user_id=?",
+            (user["sub"],)
+        ).fetchone()["m"]
+        try:
+            db.execute(
+                "INSERT INTO draft_queue (user_id, player_id, priority) VALUES (?, ?, ?)",
+                (user["sub"], req.player_id, max_pri + 1)
+            )
+        except Exception:
+            raise HTTPException(400, "Player already in queue")
+    return {"message": "Added to queue"}
+
+
+@app.delete("/api/draft/queue/{player_id}")
+def remove_from_draft_queue(player_id: int, user=Depends(get_current_user)):
+    """Remove a player from the draft queue."""
+    with get_db() as db:
+        db.execute("DELETE FROM draft_queue WHERE user_id=? AND player_id=?",
+                   (user["sub"], player_id))
+    return {"message": "Removed from queue"}
+
+
+@app.put("/api/draft/auto-draft")
+def toggle_auto_draft(user=Depends(get_current_user)):
+    """Toggle auto-draft on/off."""
+    with get_db() as db:
+        db.execute("UPDATE users SET auto_draft = 1 - COALESCE(auto_draft, 0) WHERE id=?", (user["sub"],))
+        new_val = db.execute("SELECT auto_draft FROM users WHERE id=?", (user["sub"],)).fetchone()
+    return {"auto_draft": bool(new_val["auto_draft"]), "message": f"Auto-draft {'enabled' if new_val['auto_draft'] else 'disabled'}"}
+
+
+@app.get("/api/draft/auto-draft")
+def get_auto_draft_status(user=Depends(get_current_user)):
+    with get_db() as db:
+        row = db.execute("SELECT auto_draft FROM users WHERE id=?", (user["sub"],)).fetchone()
+    return {"auto_draft": bool(row["auto_draft"]) if row else False}
+
+
+async def auto_pick_for_team(team_id: int, draft_id: int, pick_num: int, reason: str = "timer"):
+    """Auto-pick for a team: use their queue first, then best available."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        team = db.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+        if not team:
+            return None
+
+        # Get unavailable players
+        picked = db.execute("SELECT player_id FROM draft_picks WHERE draft_id=?", (draft_id,)).fetchall()
+        rostered = db.execute("SELECT DISTINCT player_id FROM roster").fetchall()
+        unavailable = {r["player_id"] for r in picked} | {r["player_id"] for r in rostered}
+
+        # Get roster state for validation
+        roster = db.execute("SELECT player_id, position, salary, club_id FROM roster WHERE team_id=?", (team_id,)).fetchall()
+        used_salary = sum(r["salary"] for r in roster)
+        cap = float(get_config_val(db, "salary_cap"))
+        remaining = cap - used_salary
+        pos_counts = {"GK": 0, "DEF": 0, "MID": 0, "FWD": 0}
+        club_counts = {}
+        for r in roster:
+            pos_counts[r["position"]] = pos_counts.get(r["position"], 0) + 1
+            club_counts[r["club_id"]] = club_counts.get(r["club_id"], 0) + 1
+        limits = {
+            "GK": int(get_config_val(db, "max_gk")),
+            "DEF": int(get_config_val(db, "max_def")),
+            "MID": int(get_config_val(db, "max_mid")),
+            "FWD": int(get_config_val(db, "max_fwd")),
+        }
+        max_club = int(get_config_val(db, "max_per_club"))
+
+        def can_add(p):
+            if p["id"] in unavailable:
+                return False
+            if p.get("status") == "u":
+                return False
+            if p["salary"] > remaining:
+                return False
+            if pos_counts.get(p["position"], 0) >= limits.get(p["position"], 99):
+                return False
+            if p.get("club_id") and club_counts.get(p["club_id"], 0) >= max_club:
+                return False
+            return True
+
+        # Try queue first
+        queue = db.execute(
+            "SELECT player_id FROM draft_queue WHERE user_id=? ORDER BY priority",
+            (team["user_id"],)
+        ).fetchall()
+
+        selected = None
+        for q in queue:
+            p = all_players.get(q["player_id"])
+            if p and can_add(p):
+                selected = p
+                break
+
+        # Fallback: best available by points, prioritizing needed positions
+        if not selected:
+            available = [p for p in all_players.values() if can_add(p)]
+            # Sort by points descending
+            available.sort(key=lambda p: p.get("total_points", 0), reverse=True)
+            if available:
+                selected = available[0]
+
+        if not selected:
+            logger.warning(f"Auto-pick failed for team {team_id}: no valid players")
+            return None
+
+        # Execute the pick
+        squad_size = int(get_config_val(db, "squad_size") or "15")
+        order = json.loads(db.execute("SELECT draft_order FROM draft_state WHERE id=?", (draft_id,)).fetchone()["draft_order"])
+        num_teams = len(order)
+
+        db.execute(
+            "INSERT INTO draft_picks (draft_id, team_id, player_id, pick_number, salary) VALUES (?, ?, ?, ?, ?)",
+            (draft_id, team_id, selected["id"], pick_num, selected["salary"]),
+        )
+        db.execute(
+            "INSERT INTO roster (team_id, player_id, position, salary, club_id, acquired_via) VALUES (?, ?, ?, ?, ?, 'draft')",
+            (team_id, selected["id"], selected["position"], selected["salary"], selected.get("club_id", 0)),
+        )
+
+        # Remove from queue if it was there
+        db.execute("DELETE FROM draft_queue WHERE user_id=? AND player_id=?",
+                   (team["user_id"], selected["id"]))
+
+        new_pick = pick_num + 1
+        if new_pick >= num_teams * squad_size:
+            db.execute("UPDATE draft_state SET current_pick=?, pick_started_at=NULL, status='completed', completed_at=datetime('now') WHERE id=?",
+                       (new_pick, draft_id))
+        else:
+            db.execute("UPDATE draft_state SET current_pick=?, pick_started_at=datetime('now') WHERE id=?",
+                       (new_pick, draft_id))
+
+            # Notify next picker
+            draft_type = get_config_val(db, "draft_type") or "snake"
+            next_round = new_pick // num_teams
+            if draft_type == "snake" and next_round % 2 == 1:
+                next_idx = num_teams - 1 - (new_pick % num_teams)
+            else:
+                next_idx = new_pick % num_teams
+            next_team_id = order[next_idx]
+            next_user = db.execute("SELECT user_id FROM teams WHERE id=?", (next_team_id,)).fetchone()
+            if next_user:
+                send_push_notification(
+                    next_user["user_id"],
+                    "You're On the Clock! 🏈",
+                    f"It's your turn to draft (Pick #{new_pick + 1})",
+                    "/draft",
+                    notify_type="draft_pick"
+                )
+
+        # Track missed picks (only for timer-based auto-picks, not voluntary auto-draft)
+        if reason == "timer":
+            db.execute("UPDATE users SET missed_picks = COALESCE(missed_picks, 0) + 1 WHERE id=?", (team["user_id"],))
+            missed = db.execute("SELECT missed_picks FROM users WHERE id=?", (team["user_id"],)).fetchone()
+            if missed and missed["missed_picks"] >= 3:
+                db.execute("UPDATE users SET auto_draft=1 WHERE id=?", (team["user_id"],))
+                send_push_notification(
+                    team["user_id"],
+                    "Auto-Draft Enabled ⚠️",
+                    "You missed 3 picks — auto-draft has been turned on for the rest of the draft.",
+                    "/draft",
+                    notify_type="draft_pick"
+                )
+                logger.info(f"Auto-draft enabled for {team['name']} after 3 missed picks")
+        elif reason == "auto-draft":
+            pass  # Don't count voluntary auto-draft as a miss
+
+        # Notify the manager whose pick was auto-made
+        send_push_notification(
+            team["user_id"],
+            f"Auto-Drafted: {selected['name']}",
+            f"{selected['name']} ({selected['position']}, £{selected['salary']}m) was {'queued' if reason == 'queue' else 'auto'}-picked for you",
+            "/draft",
+            notify_type="draft_pick"
+        )
+
+        logger.info(f"Auto-picked {selected['name']} for {team['name']} (pick #{pick_num + 1}, reason: {reason})")
+        return selected
+
+
+async def check_draft_timer():
+    """Check if the current drafter's time has expired, or if they have auto-draft on."""
+    try:
+        with get_db() as db:
+            draft = db.execute("SELECT * FROM draft_state WHERE status='active' ORDER BY id DESC LIMIT 1").fetchone()
+            if not draft:
+                return
+
+            order = json.loads(draft["draft_order"]) if draft["draft_order"] else []
+            num_teams = len(order)
+            if num_teams == 0:
+                return
+
+            current_pick = draft["current_pick"] or 0
+            squad_size = int(get_config_val(db, "squad_size") or "15")
+            if current_pick >= num_teams * squad_size:
+                return
+
+            draft_type = get_config_val(db, "draft_type") or "snake"
+            round_num = current_pick // num_teams
+            if draft_type == "snake" and round_num % 2 == 1:
+                idx = num_teams - 1 - (current_pick % num_teams)
+            else:
+                idx = current_pick % num_teams
+            current_team_id = order[idx]
+
+            team = db.execute("SELECT * FROM teams WHERE id=?", (current_team_id,)).fetchone()
+            if not team:
+                return
+            user = db.execute("SELECT auto_draft FROM users WHERE id=?", (team["user_id"],)).fetchone()
+
+            # Check auto-draft
+            if user and user["auto_draft"]:
+                await auto_pick_for_team(current_team_id, draft["id"], current_pick, "auto-draft")
+                return
+
+            # Check timer
+            draft_dict = dict(draft)
+            timeout = draft_dict.get("pick_timeout_minutes") or 15
+            pick_started = draft_dict.get("pick_started_at")
+            if pick_started:
+                started = datetime.fromisoformat(pick_started.replace("Z", "+00:00")) if "T" in pick_started else datetime.strptime(pick_started, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - started).total_seconds() / 60
+                if elapsed >= timeout:
+                    await auto_pick_for_team(current_team_id, draft["id"], current_pick, "timer")
+    except Exception as e:
+        logger.error(f"Draft timer check error: {e}")
 
 
 # ── How to Play ─────────────────────────────────────────────────────────
@@ -1779,6 +2418,140 @@ def delete_how_to_play_section(section_id: int, _=Depends(require_admin)):
     with get_db() as db:
         db.execute("DELETE FROM how_to_play WHERE id=?", (section_id,))
     return {"message": "Section deleted"}
+
+
+# ── League Chat ─────────────────────────────────────────────────────────
+@app.get("/api/chat")
+def get_chat_messages(before_id: int = None, limit: int = 50, user=Depends(get_current_user)):
+    """Get chat messages, newest first. Use before_id for pagination."""
+    with get_db() as db:
+        if before_id:
+            messages = db.execute("""
+                SELECT m.id, m.message, m.created_at, u.username, u.id as user_id
+                FROM chat_messages m JOIN users u ON m.user_id = u.id
+                WHERE m.id < ?
+                ORDER BY m.id DESC LIMIT ?
+            """, (before_id, limit)).fetchall()
+        else:
+            messages = db.execute("""
+                SELECT m.id, m.message, m.created_at, u.username, u.id as user_id
+                FROM chat_messages m JOIN users u ON m.user_id = u.id
+                ORDER BY m.id DESC LIMIT ?
+            """, (limit,)).fetchall()
+    return {"messages": [dict(m) for m in messages]}
+
+
+@app.post("/api/chat")
+def post_chat_message(req: ChatMessage, user=Depends(get_current_user)):
+    if not req.message.strip():
+        raise HTTPException(400, "Message cannot be empty")
+    if len(req.message) > 2000:
+        raise HTTPException(400, "Message too long (max 2000 chars)")
+    with get_db() as db:
+        db.execute("INSERT INTO chat_messages (user_id, message) VALUES (?, ?)",
+                   (user["sub"], req.message.strip()))
+        msg_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        msg = db.execute("""
+            SELECT m.id, m.message, m.created_at, u.username, u.id as user_id
+            FROM chat_messages m JOIN users u ON m.user_id = u.id
+            WHERE m.id = ?
+        """, (msg_id,)).fetchone()
+
+        # Notify all other subscribed users
+        sender_name = msg["username"]
+        other_users = db.execute("""
+            SELECT DISTINCT ps.user_id FROM push_subscriptions ps
+            JOIN users u ON u.id = ps.user_id
+            WHERE ps.user_id != ? AND u.is_active = 1
+        """, (user["sub"],)).fetchall()
+
+    preview = req.message.strip()[:100]
+    for u in other_users:
+        send_push_notification(
+            u["user_id"],
+            f"💬 {sender_name}",
+            preview,
+            "/chat",
+            notify_type="chat_message"
+        )
+
+    return dict(msg)
+
+
+@app.delete("/api/chat/{message_id}")
+def delete_chat_message(message_id: int, user=Depends(get_current_user)):
+    """Delete a chat message (own message or admin)."""
+    with get_db() as db:
+        msg = db.execute("SELECT user_id FROM chat_messages WHERE id=?", (message_id,)).fetchone()
+        if not msg:
+            raise HTTPException(404, "Message not found")
+        if msg["user_id"] != user["sub"] and not user.get("admin"):
+            raise HTTPException(403, "Can only delete your own messages")
+        db.execute("DELETE FROM chat_messages WHERE id=?", (message_id,))
+    return {"message": "Deleted"}
+
+
+# ── Push Notifications ──────────────────────────────────────────────────
+@app.get("/api/push/vapid-key")
+def get_vapid_key():
+    """Get the VAPID public key for push subscription."""
+    return {"public_key": get_vapid_public_key()}
+
+
+@app.post("/api/push/subscribe")
+def push_subscribe(subscription: dict, user=Depends(get_current_user)):
+    """Subscribe to push notifications."""
+    keys = subscription.get("keys", {})
+    endpoint = subscription.get("endpoint")
+    if not endpoint or not keys.get("p256dh") or not keys.get("auth"):
+        raise HTTPException(400, "Invalid subscription")
+    with get_db() as db:
+        try:
+            db.execute("""
+                INSERT OR REPLACE INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+                VALUES (?, ?, ?, ?)
+            """, (user["sub"], endpoint, keys["p256dh"], keys["auth"]))
+        except Exception:
+            pass
+    return {"message": "Subscribed to push notifications"}
+
+
+@app.post("/api/push/unsubscribe")
+def push_unsubscribe(subscription: dict, user=Depends(get_current_user)):
+    """Unsubscribe from push notifications."""
+    endpoint = subscription.get("endpoint")
+    if endpoint:
+        with get_db() as db:
+            db.execute("DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?",
+                       (user["sub"], endpoint))
+    return {"message": "Unsubscribed"}
+
+
+@app.post("/api/push/test")
+def test_push(user=Depends(get_current_user)):
+    """Send a test push notification to yourself."""
+    send_push_notification(user["sub"], "Matchday Test", "Push notifications are working! ⚽", "/dashboard")
+    return {"message": "Test notification sent"}
+
+
+class BroadcastPush(BaseModel):
+    title: str
+    message: str
+    url: str = "/dashboard"
+
+
+@app.post("/api/admin/push/broadcast")
+def broadcast_push(req: BroadcastPush, _=Depends(require_admin)):
+    """Admin: send a push notification to all subscribed managers."""
+    with get_db() as db:
+        users = db.execute("""
+            SELECT DISTINCT user_id FROM push_subscriptions
+        """).fetchall()
+    sent = 0
+    for u in users:
+        send_push_notification(u["user_id"], req.title, req.message, req.url, notify_type="broadcast")
+        sent += 1
+    return {"message": f"Notification sent to {sent} managers"}
 
 
 # ── Announcements ──────────────────────────────────────────────────────
@@ -1965,6 +2738,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
             SELECT t.id, t.name, u.username, COALESCE(SUM(r.salary), 0) as total_salary
             FROM teams t JOIN users u ON t.user_id = u.id
             LEFT JOIN roster r ON r.team_id = t.id
+            WHERE u.is_active = 1
             GROUP BY t.id
         """).fetchall()
 
@@ -2053,6 +2827,7 @@ async def get_season_scoring(user=Depends(get_current_user)):
             SELECT t.id, t.name, u.username, COALESCE(SUM(r.salary), 0) as total_salary
             FROM teams t JOIN users u ON t.user_id = u.id
             LEFT JOIN roster r ON r.team_id = t.id
+            WHERE u.is_active = 1
             GROUP BY t.id
         """).fetchall()
 
@@ -2162,6 +2937,38 @@ def toggle_paid(user_id: int, _=Depends(require_admin)):
     return {"message": "Payment status toggled"}
 
 
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: int, user=Depends(require_admin)):
+    """Delete a user without losing historical data.
+    Deactivates, anonymizes, and removes current season data.
+    Past season scores in team_gameweek_scores are preserved."""
+    with get_db() as db:
+        target = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        if target["is_admin"]:
+            raise HTTPException(400, "Cannot delete an admin account")
+
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user_id,)).fetchone()
+        if team:
+            # Clear current active data but keep the team record for history
+            db.execute("DELETE FROM roster WHERE team_id=?", (team["id"],))
+            db.execute("DELETE FROM lineups WHERE team_id=?", (team["id"],))
+            db.execute("DELETE FROM wishlist WHERE user_id=?", (user_id,))
+            # Remove from active trades
+            db.execute("DELETE FROM trade_protests WHERE team_id=?", (team["id"],))
+            db.execute("DELETE FROM trade_players WHERE trade_id IN (SELECT id FROM trades WHERE (from_team_id=? OR to_team_id=?) AND status IN ('pending','in_review'))", (team["id"], team["id"]))
+            db.execute("DELETE FROM trades WHERE (from_team_id=? OR to_team_id=?) AND status IN ('pending','in_review')", (team["id"], team["id"]))
+
+        # Anonymize the user record (keep it for foreign key references)
+        db.execute("""
+            UPDATE users SET is_active=0, email=?, username=?, password_hash='deleted'
+            WHERE id=?
+        """, (f"deleted-{user_id}@removed", f"[Deleted User {user_id}]", user_id))
+
+    return {"message": f"User deleted — historical data preserved"}
+
+
 @app.post("/api/admin/draft/reset")
 def reset_draft(_=Depends(require_admin)):
     with get_db() as db:
@@ -2228,8 +3035,9 @@ async def end_season(_=Depends(require_admin)):
 
 
 @app.post("/api/admin/seasons/start")
-def start_new_season(name: str = "2026/27", _=Depends(require_admin)):
-    """Start a new season: create season, clear active rosters/lineups/scores."""
+def start_new_season(req: SeasonStart, _=Depends(require_admin)):
+    """Start a new season: create season, clear rosters/lineups/draft/trades."""
+    name = req.name
     with get_db() as db:
         # Make sure no other season is active
         db.execute("UPDATE seasons SET status='archived', ended_at=datetime('now') WHERE status='active'")
@@ -2238,10 +3046,63 @@ def start_new_season(name: str = "2026/27", _=Depends(require_admin)):
         db.execute("INSERT INTO seasons (name, status) VALUES (?, 'active')", (name,))
         new_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
 
-        # Reset user payment status for new season
+        # Clear all active game data for fresh start (order matters for foreign keys)
+        db.execute("DELETE FROM trade_protests")
+        db.execute("DELETE FROM trade_players")
+        db.execute("DELETE FROM trades")
+        db.execute("DELETE FROM draft_picks")
+        db.execute("DELETE FROM draft_state")
+        db.execute("DELETE FROM lineups")
+        db.execute("DELETE FROM roster")
+        db.execute("DELETE FROM transactions")
+        db.execute("DELETE FROM wishlist")
+        db.execute("DELETE FROM gameweek_player_scores")
+        db.execute("DELETE FROM team_gameweek_scores")
+
+        # Reset user payment status
         db.execute("UPDATE users SET has_paid=0")
 
-    return {"message": f"Season '{name}' started", "season_id": new_id}
+        # Update season name in config
+        db.execute("UPDATE league_config SET value=? WHERE key='season_name'", (name,))
+
+    return {"message": f"Season '{name}' started — all rosters cleared for fresh draft", "season_id": new_id}
+
+
+@app.delete("/api/admin/seasons/{season_id}")
+def delete_season(season_id: int, _=Depends(require_admin)):
+    """Delete an archived season and its snapshot data."""
+    with get_db() as db:
+        season = db.execute("SELECT * FROM seasons WHERE id=?", (season_id,)).fetchone()
+        if not season:
+            raise HTTPException(404, "Season not found")
+        if season["status"] == "active":
+            raise HTTPException(400, "Cannot delete the active season")
+        db.execute("DELETE FROM player_snapshot WHERE season_id=?", (season_id,))
+        db.execute("DELETE FROM seasons WHERE id=?", (season_id,))
+    return {"message": f"Season '{season['name']}' deleted"}
+
+
+@app.post("/api/admin/remove-player")
+async def admin_remove_player(req: DropPlayer, _=Depends(require_admin)):
+    """Admin: remove a player from whichever team has them."""
+    with get_db() as db:
+        roster_entry = db.execute("""
+            SELECT r.id, r.team_id, t.name as team_name
+            FROM roster r JOIN teams t ON t.id = r.team_id
+            WHERE r.player_id=?
+        """, (req.player_id,)).fetchone()
+        if not roster_entry:
+            raise HTTPException(404, "Player is not on any roster")
+        db.execute("DELETE FROM roster WHERE id=?", (roster_entry["id"],))
+        db.execute("DELETE FROM lineups WHERE player_id=?", (req.player_id,))
+        db.execute(
+            "INSERT INTO transactions (team_id, player_id, action, details) VALUES (?, ?, 'admin_remove', 'Removed by admin')",
+            (roster_entry["team_id"], req.player_id),
+        )
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    player = all_players.get(req.player_id, {})
+    return {"message": f"Removed {player.get('name', f'#{req.player_id}')} from {roster_entry['team_name']}"}
 
 
 @app.get("/api/seasons/{season_id}/standings")
@@ -2255,6 +3116,7 @@ async def get_season_standings(season_id: int, user=Depends(get_current_user)):
         teams = db.execute("""
             SELECT t.id, t.name, u.username
             FROM teams t JOIN users u ON t.user_id = u.id
+            WHERE u.is_active = 1
         """).fetchall()
 
         standings = []
@@ -2282,8 +3144,9 @@ def get_free_agency_status(user=Depends(get_current_user)):
     """Check if free agency window is currently open."""
     with get_db() as db:
         enabled = get_config_val(db, "free_agency_enabled") == "1"
+        waiver_type = get_config_val(db, "waiver_type") or "none"
         if not enabled:
-            return {"enabled": False, "open": True, "message": "Free agency restrictions are off"}
+            return {"enabled": False, "open": True, "waiver_type": waiver_type, "message": "Free agency restrictions are off"}
 
         day_start = int(get_config_val(db, "free_agency_day_start") or "2")
         day_end = int(get_config_val(db, "free_agency_day_end") or "4")
@@ -2308,9 +3171,206 @@ def get_free_agency_status(user=Depends(get_current_user)):
     return {
         "enabled": True,
         "open": in_window,
+        "waiver_type": waiver_type,
         "window": f"{day_names[day_start]}-{day_names[day_end]}, {hour_start}:00-{hour_end}:00 ET",
         "message": "Free agency is open" if in_window else f"Free agency opens {day_names[day_start]} at {hour_start}:00 ET",
     }
+
+
+# ── Waivers ─────────────────────────────────────────────────────────────
+def get_waiver_priority(db) -> list:
+    """Calculate waiver priority based on inverse standings (last place = priority 1)."""
+    teams = db.execute("""
+        SELECT t.id, t.name, COALESCE(SUM(tgs.weekly_points), 0) as total_points
+        FROM teams t
+        JOIN users u ON t.user_id = u.id
+        LEFT JOIN team_gameweek_scores tgs ON tgs.team_id = t.id
+        WHERE u.is_active = 1
+        GROUP BY t.id
+        ORDER BY total_points ASC
+    """).fetchall()
+    return [{"team_id": t["id"], "team_name": t["name"], "total_points": t["total_points"], "priority": i + 1} for i, t in enumerate(teams)]
+
+
+@app.get("/api/waivers/priority")
+def get_waiver_order(user=Depends(get_current_user)):
+    """Get current waiver priority order (inverse standings)."""
+    with get_db() as db:
+        priority = get_waiver_priority(db)
+    return {"priority": priority}
+
+
+@app.post("/api/waivers/claim")
+async def submit_waiver_claim(req: WaiverClaim, user=Depends(get_current_user)):
+    """Submit a waiver claim for a player."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    player = all_players.get(req.player_id)
+    if not player:
+        raise HTTPException(404, "Player not found")
+
+    with get_db() as db:
+        # Check draft completed
+        draft = db.execute("SELECT status FROM draft_state ORDER BY id DESC LIMIT 1").fetchone()
+        if not draft or draft["status"] != "completed":
+            raise HTTPException(400, "Waivers are locked until the draft is complete")
+
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            raise HTTPException(404, "No team found")
+
+        # Check player isn't already rostered
+        taken = db.execute("SELECT t.name FROM roster r JOIN teams t ON t.id = r.team_id WHERE r.player_id=?",
+                           (req.player_id,)).fetchone()
+        if taken:
+            raise HTTPException(400, f"Player already on {taken['name']}")
+
+        # Check not already claimed by this user
+        existing = db.execute("SELECT id FROM waiver_claims WHERE user_id=? AND player_id=? AND status='pending'",
+                              (user["sub"], req.player_id)).fetchone()
+        if existing:
+            raise HTTPException(400, "You already have a pending claim for this player")
+
+        # If drop player specified, validate they own them
+        if req.drop_player_id:
+            on_roster = db.execute("SELECT id FROM roster WHERE team_id=? AND player_id=?",
+                                   (team["id"], req.drop_player_id)).fetchone()
+            if not on_roster:
+                raise HTTPException(400, "You don't have the player you're trying to drop")
+
+        # Basic roster validation
+        roster = db.execute("SELECT player_id, position, salary FROM roster WHERE team_id=?", (team["id"],)).fetchall()
+        squad_size = int(get_config_val(db, "squad_size") or "15")
+        needs_drop = len(roster) >= squad_size and not req.drop_player_id
+        if needs_drop:
+            raise HTTPException(400, "Roster is full — select a player to drop")
+
+        db.execute(
+            "INSERT INTO waiver_claims (user_id, team_id, player_id, drop_player_id) VALUES (?, ?, ?, ?)",
+            (user["sub"], team["id"], req.player_id, req.drop_player_id)
+        )
+    return {"message": f"Waiver claim submitted for {player['name']}"}
+
+
+@app.get("/api/waivers/claims")
+def get_my_waiver_claims(user=Depends(get_current_user)):
+    """Get current user's pending waiver claims."""
+    with get_db() as db:
+        team = db.execute("SELECT id FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        if not team:
+            return {"claims": []}
+        claims = db.execute("""
+            SELECT * FROM waiver_claims WHERE team_id=? AND status='pending'
+            ORDER BY created_at
+        """, (team["id"],)).fetchall()
+    return {"claims": [dict(c) for c in claims]}
+
+
+@app.delete("/api/waivers/claims/{claim_id}")
+def cancel_waiver_claim(claim_id: int, user=Depends(get_current_user)):
+    """Cancel a pending waiver claim."""
+    with get_db() as db:
+        claim = db.execute("SELECT * FROM waiver_claims WHERE id=? AND user_id=? AND status='pending'",
+                           (claim_id, user["sub"])).fetchone()
+        if not claim:
+            raise HTTPException(404, "Claim not found")
+        db.execute("DELETE FROM waiver_claims WHERE id=?", (claim_id,))
+    return {"message": "Claim cancelled"}
+
+
+@app.post("/api/admin/waivers/process")
+async def admin_process_waivers(_=Depends(require_admin)):
+    """Admin: manually process all pending waiver claims."""
+    results = await process_waiver_claims()
+    return {"message": f"Processed {results['processed']} claims: {results['successful']} successful, {results['failed']} failed"}
+
+
+async def process_waiver_claims():
+    """Process all pending waiver claims in waiver priority order."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+    results = {"processed": 0, "successful": 0, "failed": 0}
+
+    with get_db() as db:
+        # Get waiver priority
+        priority_list = get_waiver_priority(db)
+        team_priority = {t["team_id"]: t["priority"] for t in priority_list}
+
+        # Get all pending claims with priority
+        claims = db.execute("SELECT * FROM waiver_claims WHERE status='pending' ORDER BY created_at").fetchall()
+        if not claims:
+            return results
+
+        # Sort by waiver priority (lower number = higher priority)
+        sorted_claims = sorted(claims, key=lambda c: team_priority.get(c["team_id"], 999))
+
+        # Track players already claimed in this round
+        claimed_players = set()
+
+        for claim in sorted_claims:
+            results["processed"] += 1
+            player = all_players.get(claim["player_id"])
+
+            # Skip if player already claimed by higher priority team
+            if claim["player_id"] in claimed_players:
+                db.execute("UPDATE waiver_claims SET status='outbid', processed_at=datetime('now') WHERE id=?", (claim["id"],))
+                results["failed"] += 1
+                continue
+
+            # Skip if player was rostered since claim
+            taken = db.execute("SELECT id FROM roster WHERE player_id=?", (claim["player_id"],)).fetchone()
+            if taken:
+                db.execute("UPDATE waiver_claims SET status='unavailable', processed_at=datetime('now') WHERE id=?", (claim["id"],))
+                results["failed"] += 1
+                continue
+
+            if not player:
+                db.execute("UPDATE waiver_claims SET status='failed', processed_at=datetime('now') WHERE id=?", (claim["id"],))
+                results["failed"] += 1
+                continue
+
+            # Validate roster rules
+            error = validate_roster(db, claim["team_id"], adding_player=player,
+                                    dropping_player_id=claim["drop_player_id"])
+            if error:
+                db.execute("UPDATE waiver_claims SET status='failed', processed_at=datetime('now') WHERE id=?", (claim["id"],))
+                results["failed"] += 1
+                continue
+
+            # Execute: drop player if specified
+            if claim["drop_player_id"]:
+                db.execute("DELETE FROM roster WHERE team_id=? AND player_id=?",
+                           (claim["team_id"], claim["drop_player_id"]))
+                db.execute(
+                    "INSERT INTO transactions (team_id, player_id, action, details) VALUES (?, ?, 'drop', 'Dropped for waiver claim')",
+                    (claim["team_id"], claim["drop_player_id"])
+                )
+
+            # Add player
+            db.execute(
+                "INSERT INTO roster (team_id, player_id, position, salary, club_id, acquired_via) VALUES (?, ?, ?, ?, ?, 'waiver')",
+                (claim["team_id"], claim["player_id"], player["position"], player["salary"], player.get("club_id", 0))
+            )
+            db.execute(
+                "INSERT INTO transactions (team_id, player_id, action, details) VALUES (?, ?, 'waiver', ?)",
+                (claim["team_id"], claim["player_id"], json.dumps({"name": player["name"], "salary": player["salary"]}))
+            )
+            db.execute("UPDATE waiver_claims SET status='successful', processed_at=datetime('now') WHERE id=?", (claim["id"],))
+
+            claimed_players.add(claim["player_id"])
+            results["successful"] += 1
+
+            # Notify the manager
+            send_push_notification(
+                claim["user_id"],
+                f"Waiver Claim Won: {player['name']}",
+                f"You picked up {player['name']} ({player['position']}, £{player['salary']}m) off waivers",
+                "/team",
+                notify_type="trade_proposed"
+            )
+
+    logger.info(f"Waivers processed: {results}")
+    return results
 
 
 @app.get("/api/transactions")
@@ -2324,6 +3384,45 @@ def get_transactions(user=Depends(get_current_user)):
             (team["id"],),
         ).fetchall()
     return {"transactions": [dict(t) for t in txns]}
+
+
+@app.get("/api/transactions/league")
+async def get_league_transactions(team_id: int = None, action: str = None, limit: int = 100, offset: int = 0, user=Depends(get_current_user)):
+    """Get all transactions across the league with player details."""
+    fpl_data = await get_fpl_data()
+    all_players = {p["id"]: p for p in parse_players(fpl_data)}
+
+    with get_db() as db:
+        query = """
+            SELECT tx.*, t.name as team_name
+            FROM transactions tx
+            JOIN teams t ON t.id = tx.team_id
+            WHERE 1=1
+        """
+        params = []
+        if team_id:
+            query += " AND tx.team_id=?"
+            params.append(team_id)
+        if action:
+            query += " AND tx.action=?"
+            params.append(action)
+        query += " ORDER BY tx.created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        txns = db.execute(query, params).fetchall()
+        total = db.execute("SELECT COUNT(*) as c FROM transactions").fetchone()["c"]
+
+    enriched = []
+    for tx in txns:
+        tx_dict = dict(tx)
+        player = all_players.get(tx["player_id"], {})
+        tx_dict["player_name"] = player.get("name", f"Player #{tx['player_id']}")
+        tx_dict["player_position"] = player.get("position", "?")
+        tx_dict["player_club"] = player.get("club_name", "")
+        tx_dict["player_salary"] = player.get("salary", 0)
+        enriched.append(tx_dict)
+
+    return {"transactions": enriched, "total": total}
 
 
 # ── FPL Live Gameweek Data ─────────────────────────────────────────────
@@ -2591,11 +3690,11 @@ async def get_standings():
         teams = db.execute("""
             SELECT t.id, t.name, u.username
             FROM teams t JOIN users u ON t.user_id = u.id
+            WHERE u.is_active = 1
         """).fetchall()
 
         standings = []
         for team in teams:
-            # Get all weekly scores
             weekly = db.execute(
                 "SELECT gameweek, weekly_points FROM team_gameweek_scores WHERE team_id=? ORDER BY gameweek",
                 (team["id"],)
@@ -2718,7 +3817,66 @@ async def auto_refresh_scores():
 _scheduler_task = None
 
 async def score_scheduler():
-    """Run score refresh every hour."""
+    """Run score refresh every hour + lineup reminders + draft timer."""
     while True:
-        await asyncio.sleep(3600)  # 1 hour
+        await check_draft_timer()
+        await asyncio.sleep(30)  # Check draft timer every 30 seconds
+        # Run hourly tasks every 120 iterations (120 * 30s = 1 hour)
+
+
+async def hourly_scheduler():
+    """Run hourly tasks."""
+    while True:
+        await asyncio.sleep(3600)
         await auto_refresh_scores()
+        await send_lineup_reminders()
+
+
+async def send_lineup_reminders():
+    """Check for upcoming GW deadlines and remind managers who haven't set lineups."""
+    try:
+        fpl_data = await get_fpl_data()
+        events = fpl_data.get("events", [])
+
+        # Find the next upcoming gameweek
+        next_gw = None
+        for ev in events:
+            if ev.get("is_next"):
+                next_gw = ev
+                break
+
+        if not next_gw or not next_gw.get("deadline_time"):
+            return
+
+        deadline = datetime.fromisoformat(next_gw["deadline_time"].replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        hours_until = (deadline - now).total_seconds() / 3600
+
+        # Send reminder when deadline is 12-13 hours away (catches the hourly check once)
+        if not (12 <= hours_until <= 13):
+            return
+
+        gw = next_gw["id"]
+        with get_db() as db:
+            teams = db.execute("""
+                SELECT t.id, t.name, t.user_id FROM teams t
+                JOIN users u ON t.user_id = u.id
+                WHERE u.is_active = 1
+            """).fetchall()
+
+            for team in teams:
+                lineup = db.execute(
+                    "SELECT id FROM lineups WHERE team_id=? AND gameweek=?",
+                    (team["id"], gw)
+                ).fetchone()
+                if not lineup:
+                    send_push_notification(
+                        team["user_id"],
+                        f"Set Your Lineup — GW{gw}",
+                        f"Deadline is in ~12 hours! Your lineup will carry forward if you don't update it.",
+                        "/team",
+                        notify_type="lineup_reminder"
+                    )
+                    logger.info(f"Sent lineup reminder to {team['name']} for GW{gw}")
+    except Exception as e:
+        logger.error(f"Lineup reminder error: {e}")
