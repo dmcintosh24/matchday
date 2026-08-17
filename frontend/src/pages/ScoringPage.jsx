@@ -18,7 +18,7 @@ export default function ScoringPage() {
     api.get('/schedule').then(d => {
       const gws = d.gameweeks || [];
       setGameweeks(gws);
-      const current = gws.find(g => g.is_current) || gws.findLast(g => g.finished);
+      const current = gws.find(g => g.is_current) || gws.find(g => g.is_next) || gws.findLast(g => g.finished);
       if (current) setSelectedGW(current.id);
       setLoading(false);
     }).catch(() => setLoading(false));
@@ -105,6 +105,12 @@ export default function ScoringPage() {
                             style={{ width: 24, height: 24, borderRadius: 4, objectFit: 'contain', background: 'var(--bg-input)' }}
                             onError={e => e.target.style.display = 'none'} />
                           <span style={{ fontWeight: 600 }}>{t.team_name}</span>
+                          {!t.paid && (
+                            <span title="Has not paid league dues" style={{
+                              fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.4rem', borderRadius: 4,
+                              background: 'var(--danger-bg, #fde2e2)', color: 'var(--danger, #dc2626)',
+                            }}>UNPAID</span>
+                          )}
                         </div>
                         <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginLeft: '0.5rem' }}>{t.manager}</span>
                       </div>

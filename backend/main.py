@@ -2735,7 +2735,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
 
     with get_db() as db:
         teams = db.execute("""
-            SELECT t.id, t.name, u.username, COALESCE(SUM(r.salary), 0) as total_salary
+            SELECT t.id, t.name, u.username, u.has_paid, COALESCE(SUM(r.salary), 0) as total_salary
             FROM teams t JOIN users u ON t.user_id = u.id
             LEFT JOIN roster r ON r.team_id = t.id
             WHERE u.is_active = 1
@@ -2805,6 +2805,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                 "team_id": tid,
                 "team_name": team["name"],
                 "manager": team["username"],
+                "paid": bool(team["has_paid"]),
                 "weekly_points": team_total,
                 "total_salary": team_salary,
                 "players": players_detail,
