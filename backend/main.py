@@ -1353,7 +1353,10 @@ def list_teams(user=Depends(get_current_user)):
 @app.get("/api/teams/mine")
 async def get_my_team(user=Depends(get_current_user)):
     with get_db() as db:
-        team = db.execute("SELECT * FROM teams WHERE user_id=?", (user["sub"],)).fetchone()
+        team = db.execute("""
+            SELECT t.*, u.has_paid FROM teams t JOIN users u ON t.user_id = u.id
+            WHERE t.user_id=?
+        """, (user["sub"],)).fetchone()
         if not team:
             raise HTTPException(404, "No team found. Create one first.")
         roster = db.execute("SELECT * FROM roster WHERE team_id=?", (team["id"],)).fetchall()
@@ -1367,8 +1370,10 @@ async def get_my_team(user=Depends(get_current_user)):
         enriched.append({**dict(r), **player_info})
 
     total_salary = sum(r["salary"] for r in roster)
+    team_dict = dict(team)
+    team_dict["paid"] = bool(team_dict.pop("has_paid", 0))
     return {
-        "team": dict(team),
+        "team": team_dict,
         "roster": enriched,
         "salary_cap": cap,
         "salary_used": total_salary,
@@ -3689,7 +3694,7 @@ async def get_standings():
 
     with get_db() as db:
         teams = db.execute("""
-            SELECT t.id, t.name, u.username
+            SELECT t.id, t.name, u.username, u.has_paid
             FROM teams t JOIN users u ON t.user_id = u.id
             WHERE u.is_active = 1
         """).fetchall()
@@ -3711,6 +3716,7 @@ async def get_standings():
                 "team_id": team["id"],
                 "team_name": team["name"],
                 "manager": team["username"],
+                "paid": bool(team["has_paid"]),
                 "total_points": total_points,
                 "current_gw_points": current_week_pts,
                 "weekly_scores": weekly_dict,

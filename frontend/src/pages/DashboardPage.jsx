@@ -252,6 +252,12 @@ export default function DashboardPage() {
                         style={{ width: 22, height: 22, borderRadius: 4, objectFit: 'contain', background: 'var(--bg-input)' }}
                         onError={e => e.target.style.display = 'none'} />
                       <span style={{ fontWeight: 600 }}>{s.team_name}</span>
+                      {!s.paid && (
+                        <span title="Has not paid league dues" style={{
+                          fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.4rem', borderRadius: 4,
+                          background: '#fde2e2', color: '#dc2626',
+                        }}>UNPAID</span>
+                      )}
                     </div>
                   </td>
                   <td style={{ color: 'var(--text-muted)' }}>{s.manager}</td>

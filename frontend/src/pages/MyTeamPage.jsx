@@ -144,6 +144,12 @@ export default function MyTeamPage() {
             </label>
           </div>
           <h1 style={{ margin: 0 }}>{data.team.name}</h1>
+          {!data.team.paid && (
+            <span title="Has not paid league dues" style={{
+              fontSize: '0.65rem', fontWeight: 700, padding: '0.15rem 0.5rem', borderRadius: 4,
+              background: '#fde2e2', color: '#dc2626', marginLeft: '0.5rem',
+            }}>UNPAID</span>
+          )}
           <button className="btn btn-sm btn-secondary" onClick={async () => {
             const newName = prompt('Enter new team name:', data.team.name);
             if (!newName || newName === data.team.name) return;
