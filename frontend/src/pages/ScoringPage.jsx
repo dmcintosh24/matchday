@@ -146,6 +146,7 @@ export default function ScoringPage() {
                               <th style={{ textAlign: 'center' }}>CS</th>
                               <th style={{ textAlign: 'center' }} title="Defensive Contribution (tackles, blocks, interceptions, recoveries)">DC</th>
                               <th style={{ textAlign: 'center' }} title="Goals Conceded">GC</th>
+                              <th style={{ textAlign: 'center' }} title="Saves">Saves</th>
                               <th style={{ textAlign: 'center' }}>Bonus</th>
                               <th style={{ textAlign: 'center' }}>Pts</th>
                             </tr>
@@ -156,7 +157,7 @@ export default function ScoringPage() {
                               const firstBench = pi > 0 && t.players[pi - 1]?.is_starter && isBench;
                               return (
                                 <>{firstBench && (
-                                  <tr key="bench"><td colSpan={12} style={{
+                                  <tr key="bench"><td colSpan={13} style={{
                                     textAlign: 'center', fontSize: '0.7rem', fontWeight: 600,
                                     color: 'var(--text-muted)', textTransform: 'uppercase', background: 'var(--bg-input)',
                                   }}>Bench</td></tr>
@@ -192,6 +193,7 @@ export default function ScoringPage() {
                                   <td style={{ textAlign: 'center' }}>{p.clean_sheets || '—'}</td>
                                   <td style={{ textAlign: 'center' }}>{p.defensive_contribution || '—'}</td>
                                   <td style={{ textAlign: 'center' }}>{p.goals_conceded || '—'}</td>
+                                  <td style={{ textAlign: 'center' }}>{p.saves || '—'}</td>
                                   <td style={{ textAlign: 'center' }}>{p.bonus || '—'}</td>
                                   <td style={{ textAlign: 'center', fontWeight: 700, color: p.is_starter ? 'var(--accent)' : 'var(--text-muted)' }}>
                                     {p.is_starter ? p.counting_points : `(${p.gw_points})`}

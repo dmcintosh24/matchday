@@ -2809,6 +2809,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     detail = json.loads(row.pop("detail") or "{}")
                     row["defensive_contribution"] = detail.get("defensive_contribution", 0)
                     row["goals_conceded"] = detail.get("goals_conceded", 0)
+                    row["saves"] = detail.get("saves", 0)
                     gw_scores[r["player_id"]] = row
 
             players_detail = []
@@ -2844,6 +2845,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     "bonus": s.get("bonus", 0),
                     "defensive_contribution": s.get("defensive_contribution", 0),
                     "goals_conceded": s.get("goals_conceded", 0),
+                    "saves": s.get("saves", 0),
                     "minutes": minutes,
                     "play_status": play_status,
                 })
@@ -3860,6 +3862,7 @@ async def get_gw_player_scores(gameweek: int, user=Depends(get_current_user)):
             "gw_bonus": s.get("bonus", 0),
             "gw_defensive_contribution": detail.get("defensive_contribution", 0),
             "gw_goals_conceded": detail.get("goals_conceded", 0),
+            "gw_saves": detail.get("saves", 0),
         })
 
     # Sort: starters first, then by points
