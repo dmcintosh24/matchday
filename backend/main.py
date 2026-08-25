@@ -3836,6 +3836,7 @@ async def get_gw_player_scores(gameweek: int, user=Depends(get_current_user)):
         is_starter = lineup_map.get(pid, 0)
         pts = s.get("points", 0) if is_starter else 0
         starter_total += pts
+        detail = json.loads(s.get("detail") or "{}")
         players.append({
             **p,
             "gw_points": s.get("points", 0),
@@ -3846,6 +3847,8 @@ async def get_gw_player_scores(gameweek: int, user=Depends(get_current_user)):
             "gw_assists": s.get("assists", 0),
             "gw_clean_sheets": s.get("clean_sheets", 0),
             "gw_bonus": s.get("bonus", 0),
+            "gw_defensive_contribution": detail.get("defensive_contribution", 0),
+            "gw_goals_conceded": detail.get("goals_conceded", 0),
         })
 
     # Sort: starters first, then by points

@@ -412,6 +412,8 @@ export default function MyTeamPage() {
                         <th style={{ textAlign: 'center' }}>Goals</th>
                         <th style={{ textAlign: 'center' }}>Assists</th>
                         <th style={{ textAlign: 'center' }}>CS</th>
+                        <th style={{ textAlign: 'center' }} title="Defensive Contribution (tackles, blocks, interceptions, recoveries)">DC</th>
+                        <th style={{ textAlign: 'center' }} title="Goals Conceded">GC</th>
                         <th style={{ textAlign: 'center' }}>Bonus</th>
                         <th style={{ textAlign: 'center' }}>Pts</th>
                       </tr>
@@ -424,7 +426,7 @@ export default function MyTeamPage() {
                           <>
                             {firstBench && (
                               <tr key="bench-divider">
-                                <td colSpan={10} style={{
+                                <td colSpan={12} style={{
                                   textAlign: 'center', fontSize: '0.75rem', fontWeight: 600,
                                   color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px',
                                   padding: '0.4rem', background: 'var(--bg-input)',
@@ -440,6 +442,8 @@ export default function MyTeamPage() {
                               <td style={{ textAlign: 'center' }}>{p.gw_goals || '—'}</td>
                               <td style={{ textAlign: 'center' }}>{p.gw_assists || '—'}</td>
                               <td style={{ textAlign: 'center' }}>{p.gw_clean_sheets || '—'}</td>
+                              <td style={{ textAlign: 'center' }}>{p.gw_defensive_contribution || '—'}</td>
+                              <td style={{ textAlign: 'center' }}>{p.gw_goals_conceded || '—'}</td>
                               <td style={{ textAlign: 'center' }}>{p.gw_bonus || '—'}</td>
                               <td style={{
                                 textAlign: 'center', fontWeight: 700,
