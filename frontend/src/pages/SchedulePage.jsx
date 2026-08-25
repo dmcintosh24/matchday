@@ -8,11 +8,15 @@ export default function SchedulePage() {
 
   useEffect(() => {
     api.get('/schedule').then(d => {
-      setGameweeks(d.gameweeks || []);
-      // Default to current or next gameweek
-      const current = d.gameweeks.find(gw => gw.is_current);
-      const next = d.gameweeks.find(gw => gw.is_next);
-      setActiveGW(current?.id || next?.id || 1);
+      const gws = d.gameweeks || [];
+      setGameweeks(gws);
+      // FPL's is_current flag stays on a GW until the next one's deadline
+      // passes, not until its matches finish, so prefer an unfinished
+      // is_current, then is_next, before falling back to whatever FPL marked.
+      const current = gws.find(gw => gw.is_current && !gw.finished)
+        || gws.find(gw => gw.is_next)
+        || gws.find(gw => gw.is_current);
+      setActiveGW(current?.id || 1);
       setLoading(false);
     }).catch(() => setLoading(false));
   }, []);

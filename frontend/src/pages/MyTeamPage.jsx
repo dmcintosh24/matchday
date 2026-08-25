@@ -18,10 +18,18 @@ export default function MyTeamPage() {
 
   const load = () => api.get('/teams/mine').then(setData).catch(() => {});
 
-  const currentGWId = () => {
-    const current = gameweeks.find(g => g.is_current) || gameweeks.find(g => g.is_next);
+  // FPL's is_current flag stays on a GW until the next one's deadline
+  // passes, not until its matches finish, so prefer an unfinished
+  // is_current, then is_next, before falling back to whatever FPL marked.
+  const resolveCurrentGW = (gws) => {
+    const current = gws.find(g => g.is_current && !g.finished)
+      || gws.find(g => g.is_next)
+      || gws.find(g => g.is_current)
+      || [...gws].reverse().find(g => g.finished);
     return current?.id || null;
   };
+
+  const currentGWId = () => resolveCurrentGW(gameweeks);
 
   const openTab = (t) => {
     setTab(t);
@@ -36,8 +44,8 @@ export default function MyTeamPage() {
     api.get('/schedule').then(d => {
       const gws = d.gameweeks || [];
       setGameweeks(gws);
-      const current = gws.find(g => g.is_current) || gws.find(g => g.is_next);
-      if (current) setSelectedGW(current.id);
+      const current = resolveCurrentGW(gws);
+      if (current) setSelectedGW(current);
     }).catch(() => {});
   }, []);
 
@@ -118,8 +126,8 @@ export default function MyTeamPage() {
   const formation = `${starterPosCounts.DEF}-${starterPosCounts.MID}-${starterPosCounts.FWD}`;
 
   // GW selector: show recent range
-  const currentGWObj = gameweeks.find(g => g.is_current) || gameweeks.find(g => g.is_next);
-  const currentIdx = currentGWObj ? gameweeks.findIndex(g => g.id === currentGWObj.id) : 0;
+  const currentGWId2 = resolveCurrentGW(gameweeks);
+  const currentIdx = currentGWId2 ? gameweeks.findIndex(g => g.id === currentGWId2) : 0;
   const startIdx = Math.max(0, currentIdx - 3);
   const visibleGWs = gameweeks.slice(startIdx, startIdx + 10);
 

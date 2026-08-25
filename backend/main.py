@@ -3567,20 +3567,37 @@ async def refresh_gameweek_scores(gw: int) -> dict:
     return {"updated": updated, "gameweek": gw}
 
 
+def resolve_current_gw(events: list) -> Optional[int]:
+    """Determine the gameweek managers should currently be acting on.
+
+    FPL's own `is_current` flag stays on a gameweek until the *next* one's
+    deadline passes, not until its matches finish — so once GW1 is over but
+    GW2 hasn't kicked off, FPL still reports GW1 as is_current and GW2 as
+    is_next. Preferring a finished is_current over is_next left the app
+    (score refresh, standings, lineup defaults) stuck on the just-finished
+    week during that whole gap, so an unfinished is_current is checked
+    first, then is_next, before falling back to whatever FPL marked.
+    """
+    for ev in events:
+        if ev.get("is_current") and not ev.get("finished"):
+            return ev["id"]
+    for ev in events:
+        if ev.get("is_next"):
+            return ev["id"]
+    for ev in events:
+        if ev.get("is_current"):
+            return ev["id"]
+    finished_ids = [ev["id"] for ev in events if ev.get("finished")]
+    return max(finished_ids) if finished_ids else None
+
+
 def get_current_gameweek_sync() -> Optional[int]:
     """Synchronously determine the current/active gameweek from cached bootstrap data."""
     if not os.path.exists(FPL_CACHE_FILE):
         return None
     with open(FPL_CACHE_FILE) as f:
         data = json.load(f)
-    events = data.get("events", [])
-    for ev in events:
-        if ev.get("is_current"):
-            return ev["id"]
-    for ev in events:
-        if ev.get("is_next"):
-            return ev["id"]
-    return None
+    return resolve_current_gw(data.get("events", []))
 
 
 # ── Lineup endpoints ───────────────────────────────────────────────────
@@ -3709,21 +3726,22 @@ async def manual_refresh_scores(user=Depends(get_current_user)):
     """Manual refresh of current gameweek scores."""
     fpl_data = await get_fpl_data()
     events = fpl_data.get("events", [])
-    current_gw = None
-    for ev in events:
-        if ev.get("is_current"):
-            current_gw = ev["id"]
-            break
-    if not current_gw:
-        for ev in events:
-            if ev.get("is_next"):
-                current_gw = ev["id"] - 1 if ev["id"] > 1 else 1
-                break
+    current_gw = resolve_current_gw(events)
     if not current_gw:
         raise HTTPException(400, "Cannot determine current gameweek")
 
-    result = await refresh_gameweek_scores(current_gw)
-    return {"message": f"Scores refreshed for GW{current_gw}", **result}
+    # Also refresh whatever FPL itself still calls "current" — its is_current
+    # flag lingers on the just-finished GW until the next one's deadline
+    # passes, and bonus points can keep changing during that gap.
+    fpl_current_gw = next((ev["id"] for ev in events if ev.get("is_current")), None)
+    gws_to_refresh = {g for g in (current_gw, fpl_current_gw) if g}
+
+    total_updated = 0
+    for gw in gws_to_refresh:
+        result = await refresh_gameweek_scores(gw)
+        total_updated += result.get("updated", 0)
+    label = "GW" + "/GW".join(str(g) for g in sorted(gws_to_refresh))
+    return {"message": f"Scores refreshed for {label}", "updated": total_updated}
 
 
 @app.post("/api/scores/refresh/{gameweek}")
@@ -3740,14 +3758,7 @@ async def get_standings():
     events = fpl_data.get("events", [])
 
     # Find current GW
-    current_gw = 1
-    for ev in events:
-        if ev.get("is_current"):
-            current_gw = ev["id"]
-            break
-        if ev.get("is_next") and ev["id"] > 1:
-            current_gw = ev["id"] - 1
-            break
+    current_gw = resolve_current_gw(events) or 1
 
     with get_db() as db:
         teams = db.execute("""
@@ -3863,14 +3874,11 @@ async def auto_refresh_scores():
     try:
         fpl_data = await get_fpl_data()
         events = fpl_data.get("events", [])
-        current_gw = None
-        for ev in events:
-            if ev.get("is_current"):
-                current_gw = ev["id"]
-                break
-        if current_gw:
-            result = await refresh_gameweek_scores(current_gw)
-            logger.info(f"Auto-refresh GW{current_gw}: updated {result.get('updated', 0)} players")
+        current_gw = resolve_current_gw(events)
+        fpl_current_gw = next((ev["id"] for ev in events if ev.get("is_current")), None)
+        for gw in {g for g in (current_gw, fpl_current_gw) if g}:
+            result = await refresh_gameweek_scores(gw)
+            logger.info(f"Auto-refresh GW{gw}: updated {result.get('updated', 0)} players")
     except Exception as e:
         logger.error(f"Auto-refresh failed: {e}")
 

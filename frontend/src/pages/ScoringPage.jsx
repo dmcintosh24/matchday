@@ -14,12 +14,23 @@ export default function ScoringPage() {
   const { PlayerLink, TeamLink } = useFotMob();
   const [msg, setMsg] = useState({ text: '', type: '' });
 
+  // FPL's is_current flag stays on a GW until the next one's deadline
+  // passes, not until its matches finish, so prefer an unfinished
+  // is_current, then is_next, before falling back to whatever FPL marked.
+  const resolveCurrentGW = (gws) => {
+    const current = gws.find(g => g.is_current && !g.finished)
+      || gws.find(g => g.is_next)
+      || gws.find(g => g.is_current)
+      || [...gws].reverse().find(g => g.finished);
+    return current?.id || null;
+  };
+
   useEffect(() => {
     api.get('/schedule').then(d => {
       const gws = d.gameweeks || [];
       setGameweeks(gws);
-      const current = gws.find(g => g.is_current) || gws.find(g => g.is_next) || gws.findLast(g => g.finished);
-      if (current) setSelectedGW(current.id);
+      const current = resolveCurrentGW(gws);
+      if (current) setSelectedGW(current);
       setLoading(false);
     }).catch(() => setLoading(false));
   }, []);
@@ -34,8 +45,8 @@ export default function ScoringPage() {
     api.get('/scoring/season').then(setSeasonData).catch(() => setSeasonData(null));
   }, [tab]);
 
-  const currentGWObj = gameweeks.find(g => g.is_current) || gameweeks.find(g => g.is_next);
-  const currentIdx = currentGWObj ? gameweeks.findIndex(g => g.id === currentGWObj.id) : 0;
+  const currentGWId = resolveCurrentGW(gameweeks);
+  const currentIdx = currentGWId ? gameweeks.findIndex(g => g.id === currentGWId) : 0;
   const startIdx = Math.max(0, currentIdx - 3);
   const visibleGWs = gameweeks.slice(startIdx, startIdx + 10);
 
