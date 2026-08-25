@@ -4,6 +4,19 @@ All notable changes to Matchday will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-08-25
+
+### Added
+- **Payment Status Indicator** — managers can see who still owes league dues via an "UNPAID" badge on the Dashboard standings, My Team page, and Scoring page.
+- **Played/Live/Not Started Status** — Scoring page player breakdown now shows whether each player's real-life match hasn't started, is live, or has finished (and whether they actually featured).
+- **Club Name on Scoring Page** — player rows in the Scoring page breakdown now show their club alongside their name.
+
+### Fixed
+- **Scoring Page Default Gameweek** — now correctly defaults to the current gameweek (falling back through current → next → last finished) instead of sometimes landing on the wrong week.
+- **Schedule Page Stuck on "Live"** — completed fixtures no longer show "Live - 90'" for hours after full-time; now reflects FPL's provisional finished status immediately at the final whistle.
+- **Stale Roster Club Data** — a rostered player's club now stays in sync with real-life transfers (previously the club captured at draft/waiver time never updated, so the UI could show incorrect club counts, e.g. appearing to exceed the max-players-per-club limit when it hadn't).
+- **Lineup Lock-In Now Blocked on Roster Rule Violations** — if a roster breaks a league rule (salary cap, position limits, max-per-club, etc.), managers can no longer save/lock a gameweek lineup until it's fixed; they now get a clear error explaining what to correct.
+
 ## [2.0.0] - 2026-08-13
 
 ### Added

@@ -128,7 +128,7 @@ export default function ScoringPage() {
                         <table>
                           <thead>
                             <tr>
-                              <th></th><th>Pos</th><th>Player</th>
+                              <th></th><th>Pos</th><th>Player</th><th>Status</th>
                               <th style={{ textAlign: 'center' }}>Mins</th>
                               <th style={{ textAlign: 'center' }}>Goals</th>
                               <th style={{ textAlign: 'center' }}>Assists</th>
@@ -143,7 +143,7 @@ export default function ScoringPage() {
                               const firstBench = pi > 0 && t.players[pi - 1]?.is_starter && isBench;
                               return (
                                 <>{firstBench && (
-                                  <tr key="bench"><td colSpan={9} style={{
+                                  <tr key="bench"><td colSpan={10} style={{
                                     textAlign: 'center', fontSize: '0.7rem', fontWeight: 600,
                                     color: 'var(--text-muted)', textTransform: 'uppercase', background: 'var(--bg-input)',
                                   }}>Bench</td></tr>
@@ -151,7 +151,28 @@ export default function ScoringPage() {
                                 <tr key={p.id} style={{ opacity: isBench ? 0.5 : 1 }}>
                                   <td>{p.is_starter ? '⚽' : ''}</td>
                                   <td><span className={`pos pos-${p.position}`}>{p.position}</span></td>
-                                  <td><PlayerLink id={p.player_id || p.id} name={p.name} /></td>
+                                  <td>
+                                    <PlayerLink id={p.player_id || p.id} name={p.name} />
+                                    {p.club_name && (
+                                      <span style={{ marginLeft: '0.4rem', fontSize: '0.7rem', color: 'var(--text-muted)' }}>
+                                        {p.club_name}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td>
+                                    {p.play_status === 'played' && (
+                                      <span style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--green)' }}>Played</span>
+                                    )}
+                                    {p.play_status === 'live' && (
+                                      <span style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--green)' }}>Live</span>
+                                    )}
+                                    {p.play_status === 'did_not_play' && (
+                                      <span style={{ fontSize: '0.7rem', fontWeight: 600, color: 'var(--text-muted)' }}>Did Not Play</span>
+                                    )}
+                                    {p.play_status === 'not_started' && (
+                                      <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>Not Started</span>
+                                    )}
+                                  </td>
                                   <td style={{ textAlign: 'center' }}>{p.minutes}</td>
                                   <td style={{ textAlign: 'center' }}>{p.goals || '—'}</td>
                                   <td style={{ textAlign: 'center' }}>{p.assists || '—'}</td>

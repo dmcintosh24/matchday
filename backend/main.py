@@ -24,7 +24,7 @@ from pydantic import BaseModel, EmailStr
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DB_PATH = os.getenv("DB_PATH", "fpl_league.db")
 LOGO_PATH = os.getenv("LOGO_PATH", "league_logo.png")
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 GITHUB_URL = "https://github.com/dmcintosh24/matchday"
 VAPID_PRIVATE_KEY_PATH = os.getenv("VAPID_PRIVATE_KEY_PATH", "vapid_private.pem")
 VAPID_PUBLIC_KEY_PATH = os.getenv("VAPID_PUBLIC_KEY_PATH", "vapid_public.pem")
@@ -710,26 +710,33 @@ async def startup():
     global _scheduler_task
     _scheduler_task = asyncio.create_task(score_scheduler())
     asyncio.create_task(hourly_scheduler())
-    asyncio.create_task(backfill_club_ids())
+    asyncio.create_task(refresh_roster_club_ids())
     logger.info("Score auto-refresh scheduler started (hourly)")
 
 
-async def backfill_club_ids():
-    """Backfill club_id for existing roster entries that don't have it."""
+async def refresh_roster_club_ids():
+    """Sync roster.club_id with each player's current FPL club.
+
+    club_id is captured once at acquisition time and never updated, so a
+    mid-season transfer leaves the stored value stale even though the rest
+    of the app (Players page, roster displays) shows the player's live
+    club. This keeps them in sync and fills in any missing values.
+    """
     try:
         fpl_data = await get_fpl_data()
         players = {p["id"]: p for p in parse_players(fpl_data)}
         with get_db() as db:
-            rows = db.execute("SELECT id, player_id FROM roster WHERE club_id IS NULL OR club_id=0").fetchall()
-            if not rows:
-                return
+            rows = db.execute("SELECT id, player_id, club_id FROM roster").fetchall()
+            updated = 0
             for r in rows:
                 p = players.get(r["player_id"])
-                if p:
+                if p and p["club_id"] != r["club_id"]:
                     db.execute("UPDATE roster SET club_id=? WHERE id=?", (p["club_id"], r["id"]))
-            logger.info(f"Backfilled club_id for {len(rows)} roster entries")
+                    updated += 1
+            if updated:
+                logger.info(f"Synced club_id for {updated} roster entries")
     except Exception as e:
-        logger.error(f"Club ID backfill failed: {e}")
+        logger.error(f"Club ID refresh failed: {e}")
 
 
 # ── Auth endpoints ──────────────────────────────────────────────────────
@@ -1181,7 +1188,7 @@ async def get_schedule():
                 gw_fixtures.append({
                     "id": f["id"],
                     "kickoff": f.get("kickoff_time"),
-                    "finished": f.get("finished", False),
+                    "finished": f.get("finished", False) or f.get("finished_provisional", False),
                     "started": f.get("started", False),
                     "home_team": home.get("name", "TBD"),
                     "home_short": home.get("short_name", "TBD"),
@@ -1264,11 +1271,15 @@ def validate_roster(db, team_id: int, adding_player: dict = None, dropping_playe
         if count > limits.get(pos, 99):
             return f"Too many {pos}s ({count}/{limits[pos]})"
 
-    if adding_player:
-        max_club = int(get_config_val(db, "max_per_club"))
-        club_count = sum(1 for r in roster_list if r.get("club_id") == adding_player.get("club_id"))
-        if club_count > max_club:
-            return f"Too many players from that club ({club_count}/{max_club})"
+    max_club = int(get_config_val(db, "max_per_club"))
+    club_counts = {}
+    for r in roster_list:
+        cid = r.get("club_id")
+        if cid:
+            club_counts[cid] = club_counts.get(cid, 0) + 1
+    over_club = next((cid for cid, count in club_counts.items() if count > max_club), None)
+    if over_club is not None:
+        return f"Too many players from that club ({club_counts[over_club]}/{max_club})"
 
     return None
 
@@ -2738,6 +2749,19 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
     fpl_data = await get_fpl_data()
     all_players = {p["id"]: p for p in parse_players(fpl_data)}
 
+    # Map each club to its fixture status for this gameweek, so we can tell
+    # whether a player's real-life match hasn't started, is live, or is over.
+    fixtures = await get_fixtures()
+    club_fixture_status = {}
+    for f in fixtures:
+        if f.get("event") != gameweek:
+            continue
+        status = "finished" if (f.get("finished") or f.get("finished_provisional")) else (
+            "live" if f.get("started") else "not_started"
+        )
+        for club_id in (f.get("team_h"), f.get("team_a")):
+            club_fixture_status[club_id] = status
+
     with get_db() as db:
         teams = db.execute("""
             SELECT t.id, t.name, u.username, u.has_paid, COALESCE(SUM(r.salary), 0) as total_salary
@@ -2789,6 +2813,16 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                 is_starter = lineup_map.get(pid, 0)
                 pts = s.get("points", 0) if is_starter else 0
                 team_total += pts
+                minutes = s.get("minutes", 0)
+                fixture_status = club_fixture_status.get(p.get("club_id"), "not_started")
+                if minutes > 0:
+                    play_status = "played"
+                elif fixture_status == "finished":
+                    play_status = "did_not_play"
+                elif fixture_status == "live":
+                    play_status = "live"
+                else:
+                    play_status = "not_started"
                 players_detail.append({
                     "id": pid,
                     "name": p.get("name", f"#{pid}"),
@@ -2802,7 +2836,8 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     "assists": s.get("assists", 0),
                     "clean_sheets": s.get("clean_sheets", 0),
                     "bonus": s.get("bonus", 0),
-                    "minutes": s.get("minutes", 0),
+                    "minutes": minutes,
+                    "play_status": play_status,
                 })
             players_detail.sort(key=lambda x: (-x["is_starter"], -x["gw_points"]))
 
@@ -3566,6 +3601,10 @@ async def set_lineup(req: SetLineup, user=Depends(get_current_user)):
         if not team:
             raise HTTPException(404, "No team found")
 
+        roster_error = validate_roster(db, team["id"])
+        if roster_error:
+            raise HTTPException(400, f"Your roster breaks a league rule and must be fixed before you can set a lineup: {roster_error}")
+
         roster = db.execute("SELECT player_id FROM roster WHERE team_id=?", (team["id"],)).fetchall()
         roster_ids = {r["player_id"] for r in roster}
 
@@ -3837,6 +3876,7 @@ async def hourly_scheduler():
         await asyncio.sleep(3600)
         await auto_refresh_scores()
         await send_lineup_reminders()
+        await refresh_roster_club_ids()
 
 
 async def send_lineup_reminders():
