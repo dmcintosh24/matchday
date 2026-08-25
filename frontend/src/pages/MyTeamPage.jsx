@@ -18,6 +18,19 @@ export default function MyTeamPage() {
 
   const load = () => api.get('/teams/mine').then(setData).catch(() => {});
 
+  const currentGWId = () => {
+    const current = gameweeks.find(g => g.is_current) || gameweeks.find(g => g.is_next);
+    return current?.id || null;
+  };
+
+  const openTab = (t) => {
+    setTab(t);
+    if (t === 'lineup' || t === 'scores') {
+      const cur = currentGWId();
+      if (cur) setSelectedGW(cur);
+    }
+  };
+
   useEffect(() => {
     load();
     api.get('/schedule').then(d => {
@@ -215,8 +228,8 @@ export default function MyTeamPage() {
 
       <div className="tabs">
         <button className={`tab ${tab === 'roster' ? 'active' : ''}`} onClick={() => setTab('roster')}>Roster</button>
-        <button className={`tab ${tab === 'lineup' ? 'active' : ''}`} onClick={() => setTab('lineup')}>Set Lineup</button>
-        <button className={`tab ${tab === 'scores' ? 'active' : ''}`} onClick={() => setTab('scores')}>GW Scores</button>
+        <button className={`tab ${tab === 'lineup' ? 'active' : ''}`} onClick={() => openTab('lineup')}>Set Lineup</button>
+        <button className={`tab ${tab === 'scores' ? 'active' : ''}`} onClick={() => openTab('scores')}>GW Scores</button>
       </div>
 
       {/* ── Roster Tab ── */}

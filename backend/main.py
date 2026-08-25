@@ -2800,10 +2800,16 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
             if player_ids:
                 placeholders = ",".join("?" * len(player_ids))
                 rows = db.execute(
-                    f"SELECT player_id, points, minutes, goals, assists, clean_sheets, bonus FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
+                    f"SELECT player_id, points, minutes, goals, assists, clean_sheets, bonus, detail FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
                     [gameweek] + player_ids
                 ).fetchall()
-                gw_scores = {r["player_id"]: dict(r) for r in rows}
+                gw_scores = {}
+                for r in rows:
+                    row = dict(r)
+                    detail = json.loads(row.pop("detail") or "{}")
+                    row["defensive_contribution"] = detail.get("defensive_contribution", 0)
+                    row["goals_conceded"] = detail.get("goals_conceded", 0)
+                    gw_scores[r["player_id"]] = row
 
             players_detail = []
             team_total = 0
@@ -2836,6 +2842,8 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     "assists": s.get("assists", 0),
                     "clean_sheets": s.get("clean_sheets", 0),
                     "bonus": s.get("bonus", 0),
+                    "defensive_contribution": s.get("defensive_contribution", 0),
+                    "goals_conceded": s.get("goals_conceded", 0),
                     "minutes": minutes,
                     "play_status": play_status,
                 })
