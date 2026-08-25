@@ -2,6 +2,15 @@ import { useState, useEffect } from 'react';
 import { api } from '../api/client';
 import { useFotMob } from '../api/useFotMob';
 
+function PtsCell({ v }) {
+  if (!v) return <td style={{ textAlign: 'center', color: 'var(--text-muted)' }}>—</td>;
+  return (
+    <td style={{ textAlign: 'center', fontWeight: 600, color: v > 0 ? 'var(--green)' : 'var(--red)' }}>
+      {v > 0 ? `+${v}` : v}
+    </td>
+  );
+}
+
 export default function MyTeamPage() {
   const [data, setData] = useState(null);
   const { PlayerLink, TeamLink } = useFotMob();
@@ -417,12 +426,16 @@ export default function MyTeamPage() {
                         <th>Player</th>
                         <th>Club</th>
                         <th style={{ textAlign: 'center' }}>Mins</th>
+                        <th style={{ textAlign: 'center' }} title="Appearance points">App</th>
                         <th style={{ textAlign: 'center' }}>Goals</th>
                         <th style={{ textAlign: 'center' }}>Assists</th>
                         <th style={{ textAlign: 'center' }}>CS</th>
-                        <th style={{ textAlign: 'center' }} title="Defensive Contribution (tackles, blocks, interceptions, recoveries)">DC</th>
-                        <th style={{ textAlign: 'center' }} title="Goals Conceded">GC</th>
-                        <th style={{ textAlign: 'center' }} title="Saves">Saves</th>
+                        <th style={{ textAlign: 'center' }} title="Defensive Contribution points (tackles, blocks, interceptions, recoveries)">DC</th>
+                        <th style={{ textAlign: 'center' }} title="Goals Conceded penalty">GC</th>
+                        <th style={{ textAlign: 'center' }} title="Save/Penalty Save points">Saves</th>
+                        <th style={{ textAlign: 'center' }} title="Cards (Yellow -1 / Red -3)">Cards</th>
+                        <th style={{ textAlign: 'center' }} title="Own Goals">OG</th>
+                        <th style={{ textAlign: 'center' }} title="Penalty Missed">Pen</th>
                         <th style={{ textAlign: 'center' }}>Bonus</th>
                         <th style={{ textAlign: 'center' }}>Pts</th>
                       </tr>
@@ -435,7 +448,7 @@ export default function MyTeamPage() {
                           <>
                             {firstBench && (
                               <tr key="bench-divider">
-                                <td colSpan={13} style={{
+                                <td colSpan={17} style={{
                                   textAlign: 'center', fontSize: '0.75rem', fontWeight: 600,
                                   color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px',
                                   padding: '0.4rem', background: 'var(--bg-input)',
@@ -448,13 +461,17 @@ export default function MyTeamPage() {
                               <td><PlayerLink id={p.player_id || p.id} name={p.name} /></td>
                               <td><TeamLink name={p.club_name} /></td>
                               <td style={{ textAlign: 'center' }}>{p.gw_minutes}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_goals || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_assists || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_clean_sheets || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_defensive_contribution || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_goals_conceded || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_saves || '—'}</td>
-                              <td style={{ textAlign: 'center' }}>{p.gw_bonus || '—'}</td>
+                              <PtsCell v={p.gw_appearance} />
+                              <PtsCell v={p.gw_goals} />
+                              <PtsCell v={p.gw_assists} />
+                              <PtsCell v={p.gw_clean_sheets} />
+                              <PtsCell v={p.gw_defensive_contribution} />
+                              <PtsCell v={p.gw_goals_conceded} />
+                              <PtsCell v={p.gw_saves + (p.gw_penalty_save || 0)} />
+                              <PtsCell v={p.gw_yellow_card + p.gw_red_card} />
+                              <PtsCell v={p.gw_own_goal} />
+                              <PtsCell v={p.gw_penalty_miss} />
+                              <PtsCell v={p.gw_bonus} />
                               <td style={{
                                 textAlign: 'center', fontWeight: 700,
                                 fontFamily: 'var(--font-display)', fontSize: '1rem',

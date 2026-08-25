@@ -2800,17 +2800,10 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
             if player_ids:
                 placeholders = ",".join("?" * len(player_ids))
                 rows = db.execute(
-                    f"SELECT player_id, points, minutes, goals, assists, clean_sheets, bonus, detail FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
+                    f"SELECT player_id, points, minutes, detail FROM gameweek_player_scores WHERE gameweek=? AND player_id IN ({placeholders})",
                     [gameweek] + player_ids
                 ).fetchall()
-                gw_scores = {}
-                for r in rows:
-                    row = dict(r)
-                    detail = json.loads(row.pop("detail") or "{}")
-                    row["defensive_contribution"] = detail.get("defensive_contribution", 0)
-                    row["goals_conceded"] = detail.get("goals_conceded", 0)
-                    row["saves"] = detail.get("saves", 0)
-                    gw_scores[r["player_id"]] = row
+                gw_scores = {r["player_id"]: dict(r) for r in rows}
 
             players_detail = []
             team_total = 0
@@ -2830,6 +2823,8 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     play_status = "live"
                 else:
                     play_status = "not_started"
+                detail = json.loads(s.get("detail") or "{}")
+                breakdown = point_breakdown(p.get("position", "?"), detail)
                 players_detail.append({
                     "id": pid,
                     "name": p.get("name", f"#{pid}"),
@@ -2839,15 +2834,9 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                     "is_starter": bool(is_starter),
                     "gw_points": s.get("points", 0),
                     "counting_points": pts,
-                    "goals": s.get("goals", 0),
-                    "assists": s.get("assists", 0),
-                    "clean_sheets": s.get("clean_sheets", 0),
-                    "bonus": s.get("bonus", 0),
-                    "defensive_contribution": s.get("defensive_contribution", 0),
-                    "goals_conceded": s.get("goals_conceded", 0),
-                    "saves": s.get("saves", 0),
                     "minutes": minutes,
                     "play_status": play_status,
+                    **breakdown,
                 })
             players_detail.sort(key=lambda x: (-x["is_starter"], -x["gw_points"]))
 
@@ -3494,6 +3483,48 @@ async def fetch_gw_live(gw: int) -> dict:
         return {}
 
 
+FPL_GOAL_PTS = {"GK": 6, "DEF": 6, "MID": 5, "FWD": 4}
+FPL_CLEAN_SHEET_PTS = {"GK": 4, "DEF": 4, "MID": 1, "FWD": 0}
+FPL_DC_THRESHOLD = {"DEF": 10, "MID": 12, "FWD": 12}
+
+
+def point_breakdown(position: str, detail: dict) -> dict:
+    """Break a player's FPL total_points down into what each stat actually
+    earned, using the same official scoring rules FPL itself applies (goals,
+    total_points, etc. are pulled straight from FPL, so this reproduces —
+    not overrides — that total). Lets managers see where a score came from
+    instead of just a final number.
+    """
+    minutes = detail.get("minutes", 0)
+    goals = detail.get("goals_scored", 0)
+    assists = detail.get("assists", 0)
+    clean_sheet = detail.get("clean_sheets", 0)
+    goals_conceded = detail.get("goals_conceded", 0)
+    own_goals = detail.get("own_goals", 0)
+    penalties_saved = detail.get("penalties_saved", 0)
+    penalties_missed = detail.get("penalties_missed", 0)
+    yellow_cards = detail.get("yellow_cards", 0)
+    red_cards = detail.get("red_cards", 0)
+    saves = detail.get("saves", 0)
+    dc = detail.get("defensive_contribution", 0)
+
+    return {
+        "appearance": 2 if minutes >= 60 else (1 if minutes > 0 else 0),
+        "goals": goals * FPL_GOAL_PTS.get(position, 4),
+        "assists": assists * 3,
+        "clean_sheet": FPL_CLEAN_SHEET_PTS.get(position, 0) if (clean_sheet and minutes >= 60) else 0,
+        "saves": (saves // 3) if position == "GK" else 0,
+        "penalty_save": penalties_saved * 5,
+        "defensive_contribution": 2 if dc >= FPL_DC_THRESHOLD.get(position, 999) else 0,
+        "goals_conceded": -(goals_conceded // 2) if position in ("GK", "DEF") else 0,
+        "penalty_miss": penalties_missed * -2,
+        "own_goal": own_goals * -2,
+        "yellow_card": yellow_cards * -1,
+        "red_card": red_cards * -3,
+        "bonus": detail.get("bonus", 0),
+    }
+
+
 async def refresh_gameweek_scores(gw: int) -> dict:
     """Fetch live scores for a GW and update the database, then recalculate team scores."""
     live_data = await fetch_gw_live(gw)
@@ -3850,19 +3881,26 @@ async def get_gw_player_scores(gameweek: int, user=Depends(get_current_user)):
         pts = s.get("points", 0) if is_starter else 0
         starter_total += pts
         detail = json.loads(s.get("detail") or "{}")
+        breakdown = point_breakdown(p.get("position", "?"), detail)
         players.append({
             **p,
             "gw_points": s.get("points", 0),
             "counting_points": pts,
             "is_starter": bool(is_starter),
             "gw_minutes": s.get("minutes", 0),
-            "gw_goals": s.get("goals", 0),
-            "gw_assists": s.get("assists", 0),
-            "gw_clean_sheets": s.get("clean_sheets", 0),
-            "gw_bonus": s.get("bonus", 0),
-            "gw_defensive_contribution": detail.get("defensive_contribution", 0),
-            "gw_goals_conceded": detail.get("goals_conceded", 0),
-            "gw_saves": detail.get("saves", 0),
+            "gw_appearance": breakdown["appearance"],
+            "gw_goals": breakdown["goals"],
+            "gw_assists": breakdown["assists"],
+            "gw_clean_sheets": breakdown["clean_sheet"],
+            "gw_bonus": breakdown["bonus"],
+            "gw_defensive_contribution": breakdown["defensive_contribution"],
+            "gw_goals_conceded": breakdown["goals_conceded"],
+            "gw_saves": breakdown["saves"],
+            "gw_penalty_save": breakdown["penalty_save"],
+            "gw_penalty_miss": breakdown["penalty_miss"],
+            "gw_own_goal": breakdown["own_goal"],
+            "gw_yellow_card": breakdown["yellow_card"],
+            "gw_red_card": breakdown["red_card"],
         })
 
     # Sort: starters first, then by points
