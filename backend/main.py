@@ -3135,7 +3135,11 @@ async def admin_remove_player(req: DropPlayer, _=Depends(require_admin)):
         if not roster_entry:
             raise HTTPException(404, "Player is not on any roster")
         db.execute("DELETE FROM roster WHERE id=?", (roster_entry["id"],))
-        db.execute("DELETE FROM lineups WHERE player_id=?", (req.player_id,))
+        # Only clear this player from the current/future gameweeks' lineups —
+        # past gameweeks are already scored and locked, and must stay untouched
+        # so historical weekly scores never change retroactively.
+        current_gw = get_current_gameweek_sync() or 1
+        db.execute("DELETE FROM lineups WHERE player_id=? AND gameweek>=?", (req.player_id, current_gw))
         db.execute(
             "INSERT INTO transactions (team_id, player_id, action, details) VALUES (?, ?, 'admin_remove', 'Removed by admin')",
             (roster_entry["team_id"], req.player_id),
