@@ -3731,12 +3731,15 @@ async def get_lineup(gameweek: int, user=Depends(get_current_user)):
                     "SELECT player_id, is_starter FROM lineups WHERE team_id=? AND gameweek=?",
                     (team["id"], carried_from)
                 ).fetchall()
-                # Drop anyone since traded/dropped from the roster — a carried-forward
-                # lineup can't silently hold a slot with a player who's no longer on the team.
-                current_roster_ids = {r["player_id"] for r in db.execute(
-                    "SELECT player_id FROM roster WHERE team_id=?", (team["id"],)
-                ).fetchall()}
-                rows = [r for r in rows if r["player_id"] in current_roster_ids]
+
+        # Drop anyone since traded/dropped from the roster — a saved (or
+        # carried-forward) lineup can't silently hold a slot with a player
+        # who's no longer on the team, whether they left before or after
+        # this lineup was last saved.
+        current_roster_ids = {r["player_id"] for r in db.execute(
+            "SELECT player_id FROM roster WHERE team_id=?", (team["id"],)
+        ).fetchall()}
+        rows = [r for r in rows if r["player_id"] in current_roster_ids]
 
     fpl_data = await get_fpl_data()
     all_players = {p["id"]: p for p in parse_players(fpl_data)}
