@@ -547,7 +547,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex() == h
 
 
-def create_token(user_id: int, is_admin: bool = False, hours: int = 72) -> str:
+def create_token(user_id: int, is_admin: bool = False, hours: int = 24 * 30) -> str:
     return jwt.encode(
         {"sub": str(user_id), "admin": is_admin, "exp": datetime.now(timezone.utc) + timedelta(hours=hours)},
         SECRET_KEY,

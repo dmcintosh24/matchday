@@ -12,7 +12,11 @@ export function AuthProvider({ children }) {
     if (token) {
       api.get('/auth/me')
         .then(setUser)
-        .catch(() => localStorage.removeItem('token'))
+        // client.js already clears the token and redirects to /login on an
+        // actual 401 — don't also wipe it here on a network blip or a
+        // transient server error (e.g. mid-deploy restart), which would
+        // log out a user whose token is still perfectly valid.
+        .catch(() => {})
         .finally(() => setLoading(false));
     } else {
       setLoading(false);
