@@ -420,6 +420,7 @@ def init_db():
             ("draft_state", "pick_timeout_minutes", "INTEGER DEFAULT 15"),
             ("users", "auto_draft", "INTEGER DEFAULT 0"),
             ("users", "missed_picks", "INTEGER DEFAULT 0"),
+            ("team_gameweek_scores", "weekly_prize_paid", "INTEGER DEFAULT 0"),
         ]
         for table, col, col_type in migrations:
             try:
@@ -698,6 +699,10 @@ class ProfileUpdate(BaseModel):
     email: Optional[str] = None
     username: Optional[str] = None
     password: Optional[str] = None
+    venmo: Optional[str] = None
+    paypal: Optional[str] = None
+
+class AdminUserPaymentInfo(BaseModel):
     venmo: Optional[str] = None
     paypal: Optional[str] = None
 
@@ -2771,6 +2776,11 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
             GROUP BY t.id
         """).fetchall()
 
+        weekly_paid_rows = db.execute(
+            "SELECT team_id, weekly_prize_paid FROM team_gameweek_scores WHERE gameweek=?", (gameweek,)
+        ).fetchall()
+        weekly_paid_map = {r["team_id"]: bool(r["weekly_prize_paid"]) for r in weekly_paid_rows}
+
         team_scores = []
         for team in teams:
             tid = team["id"]
@@ -2845,6 +2855,7 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
                 "team_name": team["name"],
                 "manager": team["username"],
                 "paid": bool(team["has_paid"]),
+                "weekly_prize_paid": weekly_paid_map.get(tid, False),
                 "weekly_points": team_total,
                 "total_salary": team_salary,
                 "players": players_detail,
@@ -2853,6 +2864,29 @@ async def get_league_week_scores(gameweek: int, user=Depends(get_current_user)):
         team_scores.sort(key=lambda x: x["weekly_points"], reverse=True)
 
     return {"gameweek": gameweek, "teams": team_scores}
+
+
+@app.put("/api/admin/scoring/week/{gameweek}/team/{team_id}/toggle-weekly-paid")
+def toggle_weekly_prize_paid(gameweek: int, team_id: int, _=Depends(require_admin)):
+    """Admin: mark whether a team's weekly high-score prize has been paid out."""
+    with get_db() as db:
+        row = db.execute(
+            "SELECT weekly_prize_paid FROM team_gameweek_scores WHERE team_id=? AND gameweek=?",
+            (team_id, gameweek)
+        ).fetchone()
+        if row is None:
+            db.execute(
+                "INSERT INTO team_gameweek_scores (team_id, gameweek, weekly_points, weekly_prize_paid) VALUES (?, ?, 0, 1)",
+                (team_id, gameweek)
+            )
+            new_val = True
+        else:
+            new_val = not bool(row["weekly_prize_paid"])
+            db.execute(
+                "UPDATE team_gameweek_scores SET weekly_prize_paid=? WHERE team_id=? AND gameweek=?",
+                (int(new_val), team_id, gameweek)
+            )
+    return {"message": "Updated", "weekly_prize_paid": new_val}
 
 
 @app.get("/api/scoring/season")
@@ -2975,6 +3009,19 @@ def toggle_paid(user_id: int, _=Depends(require_admin)):
     with get_db() as db:
         db.execute("UPDATE users SET has_paid = 1 - COALESCE(has_paid, 0) WHERE id=?", (user_id,))
     return {"message": "Payment status toggled"}
+
+
+@app.put("/api/admin/users/{user_id}/payment-info")
+def update_user_payment_info(user_id: int, req: AdminUserPaymentInfo, _=Depends(require_admin)):
+    with get_db() as db:
+        target = db.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, "User not found")
+        if req.venmo is not None:
+            db.execute("UPDATE users SET venmo=? WHERE id=?", (req.venmo, user_id))
+        if req.paypal is not None:
+            db.execute("UPDATE users SET paypal=? WHERE id=?", (req.paypal, user_id))
+    return {"message": "Payment info updated"}
 
 
 @app.delete("/api/admin/users/{user_id}")

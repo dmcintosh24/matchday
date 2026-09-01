@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api/client';
 import { useFotMob } from '../api/useFotMob';
+import { useAuth } from '../contexts/AuthContext';
 
 function PtsCell({ v }) {
   if (!v) return <td style={{ textAlign: 'center', color: 'var(--text-muted)' }}>—</td>;
@@ -22,6 +23,7 @@ export default function ScoringPage() {
   const [refreshing, setRefreshing] = useState(false);
   const { PlayerLink, TeamLink } = useFotMob();
   const [msg, setMsg] = useState({ text: '', type: '' });
+  const { user } = useAuth();
 
   // FPL's is_current flag stays on a GW until the next one's deadline
   // passes, not until its matches finish, so prefer an unfinished
@@ -66,6 +68,17 @@ export default function ScoringPage() {
     seasonData.season.forEach(s => Object.keys(s.weekly_scores).forEach(g => allGWs.add(parseInt(g))));
     [...allGWs].sort((a, b) => a - b).forEach(g => seasonGWs.push(g));
   }
+
+  const toggleWeeklyPaid = async (teamId) => {
+    try {
+      await api.put(`/admin/scoring/week/${selectedGW}/team/${teamId}/toggle-weekly-paid`);
+      api.get(`/scoring/week/${selectedGW}`).then(setWeekData);
+    } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+  };
+
+  const maxWeeklyPoints = weekData?.teams?.length > 0
+    ? Math.max(...weekData.teams.map(t => t.weekly_points))
+    : null;
 
   const refreshScores = async () => {
     setRefreshing(true);
@@ -130,6 +143,21 @@ export default function ScoringPage() {
                               fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.4rem', borderRadius: 4,
                               background: 'var(--danger-bg, #fde2e2)', color: 'var(--danger, #dc2626)',
                             }}>UNPAID</span>
+                          )}
+                          {maxWeeklyPoints !== null && t.weekly_points === maxWeeklyPoints && (
+                            <span
+                              title={t.weekly_prize_paid ? 'Weekly high-score prize paid' : 'Weekly high-score prize not yet paid'}
+                              onClick={user?.is_admin ? (e) => { e.stopPropagation(); toggleWeeklyPaid(t.team_id); } : undefined}
+                              style={{
+                                fontSize: '0.65rem', fontWeight: 700, padding: '0.1rem 0.4rem', borderRadius: 4,
+                                display: 'inline-flex', alignItems: 'center', gap: '0.25rem',
+                                cursor: user?.is_admin ? 'pointer' : 'default',
+                                background: t.weekly_prize_paid ? 'rgba(22,163,74,0.12)' : 'rgba(202,138,4,0.15)',
+                                color: t.weekly_prize_paid ? 'var(--green)' : 'var(--yellow)',
+                              }}
+                            >
+                              🏆 {t.weekly_prize_paid ? 'PAID' : 'UNPAID'}
+                            </span>
                           )}
                         </div>
                         <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem', marginLeft: '0.5rem' }}>{t.manager}</span>

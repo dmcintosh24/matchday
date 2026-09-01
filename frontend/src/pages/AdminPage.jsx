@@ -9,6 +9,8 @@ export default function AdminPage() {
   const [users, setUsers] = useState([]);
   const [msg, setMsg] = useState({ text: '', type: '' });
   const [edits, setEdits] = useState({});
+  const [editingUserId, setEditingUserId] = useState(null);
+  const [paymentEdit, setPaymentEdit] = useState({ venmo: '', paypal: '' });
 
   useEffect(() => {
     if (!user?.is_admin) return;
@@ -49,6 +51,19 @@ export default function AdminPage() {
   const togglePaid = async (uid) => {
     try {
       await api.put(`/admin/users/${uid}/toggle-paid`);
+      api.get('/admin/users').then(d => setUsers(d.users));
+    } catch (err) { setMsg({ text: err.message, type: 'error' }); }
+  };
+
+  const startEditPayment = (u) => {
+    setEditingUserId(u.id);
+    setPaymentEdit({ venmo: u.venmo || '', paypal: u.paypal || '' });
+  };
+
+  const savePaymentInfo = async (uid) => {
+    try {
+      await api.put(`/admin/users/${uid}/payment-info`, paymentEdit);
+      setEditingUserId(null);
       api.get('/admin/users').then(d => setUsers(d.users));
     } catch (err) { setMsg({ text: err.message, type: 'error' }); }
   };
@@ -156,11 +171,36 @@ export default function AdminPage() {
                     <td>{u.is_admin ? '✓' : '—'}</td>
                     <td>{u.is_active ? '✓' : '✗'}</td>
                     <td style={{ color: u.has_paid ? 'var(--green)' : 'var(--red)' }}>{u.has_paid ? '✓ Paid' : '✗ Unpaid'}</td>
-                    <td style={{ fontSize: '0.8rem' }}>{u.venmo || '—'}</td>
-                    <td style={{ fontSize: '0.8rem' }}>{u.paypal || '—'}</td>
+                    {editingUserId === u.id ? (
+                      <>
+                        <td>
+                          <input type="text" value={paymentEdit.venmo} placeholder="@venmo"
+                            onChange={e => setPaymentEdit(p => ({ ...p, venmo: e.target.value }))}
+                            style={{ width: '100px', fontSize: '0.8rem' }} />
+                        </td>
+                        <td>
+                          <input type="text" value={paymentEdit.paypal} placeholder="@paypal"
+                            onChange={e => setPaymentEdit(p => ({ ...p, paypal: e.target.value }))}
+                            style={{ width: '100px', fontSize: '0.8rem' }} />
+                        </td>
+                      </>
+                    ) : (
+                      <>
+                        <td style={{ fontSize: '0.8rem' }}>{u.venmo || '—'}</td>
+                        <td style={{ fontSize: '0.8rem' }}>{u.paypal || '—'}</td>
+                      </>
+                    )}
                     <td style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>{u.created_at?.slice(0, 10)}</td>
                     <td>
                       <div style={{ display: 'flex', gap: '0.25rem', flexWrap: 'wrap' }}>
+                        {editingUserId === u.id ? (
+                          <>
+                            <button className="btn btn-sm btn-primary" onClick={() => savePaymentInfo(u.id)}>Save</button>
+                            <button className="btn btn-sm btn-secondary" onClick={() => setEditingUserId(null)}>Cancel</button>
+                          </>
+                        ) : (
+                          <button className="btn btn-sm btn-secondary" onClick={() => startEditPayment(u)}>Edit Payment Info</button>
+                        )}
                         <button className="btn btn-sm btn-secondary" onClick={() => toggleAdmin(u.id)}>
                           {u.is_admin ? 'Remove Admin' : 'Make Admin'}
                         </button>
