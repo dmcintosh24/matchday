@@ -263,7 +263,7 @@ export default function MyTeamPage() {
           ) : (
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Player</th><th>Club</th><th>Salary</th><th>Pts</th><th>Status</th><th></th></tr></thead>
+                <thead><tr><th>Player</th><th>Club</th><th>Salary</th><th>Pts</th><th>Form</th><th>Status</th><th></th></tr></thead>
                 <tbody>
                   {byPos[pos].map(p => (
                     <tr key={p.player_id}>
@@ -271,6 +271,7 @@ export default function MyTeamPage() {
                       <td>{p.club_name || '—'}</td>
                       <td>£{p.salary.toFixed(1)}m</td>
                       <td>{p.total_points ?? '—'}</td>
+                      <td>{p.form ?? '—'}</td>
                       <td>
                         <span className={`status-${p.status}`}>{p.status === 'a' ? 'Fit' : p.status === 'i' ? 'Injured' : p.status || '—'}</span>
                         {p.injury_news && <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', display: 'block' }}>{p.injury_news}</span>}

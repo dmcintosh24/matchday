@@ -85,7 +85,7 @@ export default function AdminPage() {
     'League Settings': ['season_name', 'draft_type', 'draft_timer_minutes', 'trade_review_period_hours', 'trade_protest_threshold'],
     'Free Agency': ['free_agency_enabled', 'waiver_type', 'free_agency_day_start', 'free_agency_day_end', 'free_agency_hour_start', 'free_agency_hour_end'],
     'Lineup Lock': ['lineup_lock_enabled'],
-    'Notifications': ['notify_draft_pick', 'notify_trade_proposed', 'notify_lineup_reminder', 'notify_chat_message', 'notify_broadcast'],
+    'Notifications': ['notify_draft_pick', 'notify_trade_proposed', 'notify_lineup_reminder', 'notify_lineup_reminder_2h', 'notify_chat_message', 'notify_broadcast'],
     'Payouts': ['payout_entry_fee', 'payout_weekly_prize', 'payout_1st_pct', 'payout_2nd_pct', 'payout_3rd_pct', 'payout_venmo', 'payout_paypal'],
   };
 

@@ -391,6 +391,7 @@ def init_db():
             "notify_draft_pick": ("1", "Push notification when it's your turn to draft"),
             "notify_trade_proposed": ("1", "Push notification when a trade is proposed to you"),
             "notify_lineup_reminder": ("1", "Push notification to set lineup before deadline"),
+            "notify_lineup_reminder_2h": ("1", "Push notification 2 hours before deadline if lineup not saved"),
             "notify_chat_message": ("1", "Push notification for new chat messages"),
             "notify_broadcast": ("1", "Push notification for admin broadcasts"),
         }
@@ -2634,6 +2635,34 @@ async def get_notifications(user=Depends(get_current_user)):
         if not team:
             return {"notifications": []}
 
+        # Lineup not yet saved for the next open gameweek
+        fpl_for_deadline = await get_fpl_data()
+        now_utc = datetime.now(timezone.utc)
+        next_open = next((
+            ev for ev in fpl_for_deadline.get("events", [])
+            if ev.get("deadline_time")
+            and datetime.fromisoformat(ev["deadline_time"].replace("Z", "+00:00")) > now_utc
+        ), None)
+        if next_open:
+            saved = db.execute(
+                "SELECT 1 FROM lineups WHERE team_id=? AND gameweek=? LIMIT 1",
+                (team["id"], next_open["id"])
+            ).fetchone()
+            if not saved:
+                remaining = datetime.fromisoformat(next_open["deadline_time"].replace("Z", "+00:00")) - now_utc
+                total_min = int(remaining.total_seconds() // 60)
+                days, rem_min = divmod(total_min, 1440)
+                hours, mins = divmod(rem_min, 60)
+                left = f"{days}d {hours}h" if days else (f"{hours}h {mins}m" if hours else f"{mins}m")
+                notifications.append({
+                    "type": "lineup_unsaved",
+                    "icon": "⚠️",
+                    "title": f"GW{next_open['id']} lineup not saved",
+                    "message": f"Deadline in {left} — if you don't save, last week's lineup carries forward",
+                    "link": "/team",
+                    "time": None,
+                })
+
         # Injury/news alerts for rostered players
         roster = db.execute("SELECT player_id FROM roster WHERE team_id=?", (team["id"],)).fetchall()
         roster_ids = {r["player_id"] for r in roster}
@@ -4019,8 +4048,12 @@ async def send_lineup_reminders():
         now = datetime.now(timezone.utc)
         hours_until = (deadline - now).total_seconds() / 3600
 
-        # Send reminder when deadline is 12-13 hours away (catches the hourly check once)
-        if not (12 <= hours_until <= 13):
+        # Hourly check, so each window is exactly one hour wide and fires once
+        if 12 <= hours_until <= 13:
+            notify_type, when = "lineup_reminder", "~12 hours"
+        elif 1.5 <= hours_until < 2.5:
+            notify_type, when = "lineup_reminder_2h", "~2 hours"
+        else:
             return
 
         gw = next_gw["id"]
@@ -4040,10 +4073,10 @@ async def send_lineup_reminders():
                     send_push_notification(
                         team["user_id"],
                         f"Set Your Lineup — GW{gw}",
-                        f"Deadline is in ~12 hours! Your lineup will carry forward if you don't update it.",
+                        f"Deadline is in {when}! Your lineup will carry forward if you don't update it.",
                         "/team",
-                        notify_type="lineup_reminder"
+                        notify_type=notify_type
                     )
-                    logger.info(f"Sent lineup reminder to {team['name']} for GW{gw}")
+                    logger.info(f"Sent {notify_type} to {team['name']} for GW{gw}")
     except Exception as e:
         logger.error(f"Lineup reminder error: {e}")

@@ -80,7 +80,7 @@ export default function DashboardPage() {
   }
 
   const notifColors = {
-    trade_pending: 'var(--yellow)', trade_review: 'var(--blue)',
+    lineup_unsaved: 'var(--red)', trade_pending: 'var(--yellow)', trade_review: 'var(--blue)',
     player_i: 'var(--red)', player_d: 'var(--yellow)', player_s: 'var(--red)', player_u: 'var(--red)',
   };
 
