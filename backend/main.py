@@ -2625,6 +2625,17 @@ def delete_announcement(ann_id: int, _=Depends(require_admin)):
 
 
 # ── Notifications ──────────────────────────────────────────────────────
+def previous_gw_games_done(gw_id: int, fixtures: list) -> bool:
+    """True once every fixture of the gameweek before gw_id has ended.
+
+    FPL's gameweek `finished` flag only flips after bonus points are
+    confirmed, so check each fixture (finished or finished_provisional)
+    instead, which turns true at the final whistle.
+    """
+    prev_fixtures = [f for f in fixtures if f.get("event") == gw_id - 1]
+    return all(f.get("finished") or f.get("finished_provisional") for f in prev_fixtures)
+
+
 @app.get("/api/notifications")
 async def get_notifications(user=Depends(get_current_user)):
     """Generate notifications for the current user based on roster and trades."""
@@ -2643,7 +2654,7 @@ async def get_notifications(user=Depends(get_current_user)):
             if ev.get("deadline_time")
             and datetime.fromisoformat(ev["deadline_time"].replace("Z", "+00:00")) > now_utc
         ), None)
-        if next_open:
+        if next_open and previous_gw_games_done(next_open["id"], await get_fixtures()):
             saved = db.execute(
                 "SELECT 1 FROM lineups WHERE team_id=? AND gameweek=? LIMIT 1",
                 (team["id"], next_open["id"])
@@ -4057,6 +4068,8 @@ async def send_lineup_reminders():
             return
 
         gw = next_gw["id"]
+        if not previous_gw_games_done(gw, await get_fixtures()):
+            return
         with get_db() as db:
             teams = db.execute("""
                 SELECT t.id, t.name, t.user_id FROM teams t
