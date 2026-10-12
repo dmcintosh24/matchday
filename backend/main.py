@@ -24,7 +24,7 @@ from pydantic import BaseModel, EmailStr
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 DB_PATH = os.getenv("DB_PATH", "fpl_league.db")
 LOGO_PATH = os.getenv("LOGO_PATH", "league_logo.png")
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 GITHUB_URL = "https://github.com/dmcintosh24/matchday"
 VAPID_PRIVATE_KEY_PATH = os.getenv("VAPID_PRIVATE_KEY_PATH", "vapid_private.pem")
 VAPID_PUBLIC_KEY_PATH = os.getenv("VAPID_PUBLIC_KEY_PATH", "vapid_public.pem")

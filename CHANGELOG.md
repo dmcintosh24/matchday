@@ -4,6 +4,25 @@ All notable changes to Matchday will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-10-12
+
+### Added
+- **Points Breakdown on Scoring Tables** — the Scoring page and My Team's GW Scores tab now show what each stat actually earned (appearance, goals, assists, clean sheet, defensive contribution, goals-conceded penalty, saves, cards, own goals, missed penalties, bonus) instead of raw stat counts, so every row adds up to the Pts total.
+- **Weekly Prize Paid Badge** — the week's high scorer(s) get a trophy badge on the Scoring page showing whether the weekly prize has been paid. Ties show the badge on every tied team. Admins click the badge to toggle paid/unpaid.
+- **Admin Payment Info Editing** — admins can edit any manager's Venmo and PayPal handles from the Users table.
+- **Unsaved Lineup Alert** — the Dashboard warns managers who haven't saved a lineup for the next open gameweek, with time left to the deadline. It stays hidden until every fixture of the current gameweek has finished.
+- **2-Hour Lineup Reminder** — a second push reminder goes out about 2 hours before the deadline to managers who haven't saved (admin toggle: `notify_lineup_reminder_2h`). The 12-hour reminder follows the same "wait until the current week's games are done" rule.
+- **Form Column on My Team Roster Tab** — matches the Set Lineup tab.
+- **Current Gameweek Default** — My Team's Set Lineup and GW Scores tabs open on the current gameweek.
+
+### Fixed
+- **Current Gameweek Detection** — FPL keeps `is_current` on the finished gameweek until the next deadline, which left standings, the Refresh Scores button, the hourly auto-refresh, and the Scoring/Schedule/My Team defaults stuck on the previous week. A shared `resolve_current_gw()` now picks the right week everywhere.
+- **Dropped Players Holding Lineup Slots** — a player dropped or traded away after a lineup was saved (or carried forward) no longer appears as a selected starter, which blocked saving with "Player X is not on your roster."
+- **Admin Remove Player** — no longer wipes the player from past gameweeks' lineups, so locked weekly scores can't change retroactively.
+- **Unexpected Logouts** — a network blip or a mid-deploy restart no longer clears a valid session, and sessions now last 30 days instead of 72 hours.
+- **Mobile Layout** — wide tables no longer push the whole page past the screen width; only the table scrolls.
+- **Goalkeeper Saves and Defensive Stats** — previously fetched but never displayed.
+
 ## [2.0.1] - 2026-08-25
 
 ### Added
