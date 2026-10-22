@@ -1054,7 +1054,12 @@ async def get_fotmob_player(fpl_player_id: int):
         raise HTTPException(404, "Player not found")
 
     # Search FotMob
+    name_parts = player["name"].split()
+    short_name = f"{name_parts[0]} {name_parts[-1]}" if len(name_parts) > 2 else player["name"]
     results = await fotmob_search(player["name"])
+    if not results and short_name != player["name"]:
+        # FPL full names are often longer than FotMob's ("Bruno Borges Fernandes")
+        results = await fotmob_search(short_name)
     if not results:
         # Try with just last name
         results = await fotmob_search(player["web_name"])
@@ -1068,7 +1073,8 @@ async def get_fotmob_player(fpl_player_id: int):
         # Check if names match reasonably
         if (player["web_name"].lower() in r_name or
             player["name"].lower() == r_name or
-            r_name in player["name"].lower()):
+            r_name in player["name"].lower() or
+            short_name.lower() == r_name):
             # Prefer team match
             if player_club and player_club in r_team or r_team in player_club:
                 best = r
