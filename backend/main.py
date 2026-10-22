@@ -1023,7 +1023,8 @@ async def fotmob_search_teams(term: str) -> list:
 def slugify(name: str) -> str:
     """Convert a name to a URL slug."""
     import re
-    s = name.lower().strip()
+    import unicodedata
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower().strip()
     s = re.sub(r'[^a-z0-9\s-]', '', s)
     s = re.sub(r'[\s]+', '-', s)
     return s

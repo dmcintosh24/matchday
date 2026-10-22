@@ -4,45 +4,48 @@ import { api } from '../api/client';
 // Cache FotMob URLs in memory across components
 const fotmobCache = {};
 
+// Safari and installed home-screen apps block window.open() when it runs after
+// an await (the click's user-gesture window has expired). Open the tab
+// synchronously on click, then point it at the real URL once it's known.
+function openTab(resolveUrl, fallbackUrl) {
+  const tab = window.open('about:blank', '_blank');
+  const go = (url) => {
+    if (tab) tab.location.href = url;
+    else window.location.href = url;
+  };
+  return Promise.resolve()
+    .then(resolveUrl)
+    .then(go)
+    .catch(() => go(fallbackUrl));
+}
+
 export function useFotMob() {
   const [loading, setLoading] = useState({});
 
   const openPlayer = useCallback(async (fplPlayerId, playerName, e) => {
     if (e) e.preventDefault();
-
-    // Check memory cache
-    if (fotmobCache[`player_${fplPlayerId}`]) {
-      window.open(fotmobCache[`player_${fplPlayerId}`], '_blank');
-      return;
-    }
-
+    const key = `player_${fplPlayerId}`;
     setLoading(prev => ({ ...prev, [fplPlayerId]: true }));
-    try {
-      const data = await api.get(`/fotmob/player/${fplPlayerId}`);
-      fotmobCache[`player_${fplPlayerId}`] = data.url;
-      window.open(data.url, '_blank');
-    } catch {
-      // Fallback to Google
-      window.open(`https://www.google.com/search?q=fotmob+${encodeURIComponent(playerName)}`, '_blank');
-    }
+    await openTab(async () => {
+      if (!fotmobCache[key]) {
+        const data = await api.get(`/fotmob/player/${fplPlayerId}`);
+        fotmobCache[key] = data.url;
+      }
+      return fotmobCache[key];
+    }, `https://www.google.com/search?q=fotmob+${encodeURIComponent(playerName)}`);
     setLoading(prev => ({ ...prev, [fplPlayerId]: false }));
   }, []);
 
   const openTeam = useCallback(async (clubName, e) => {
     if (e) e.preventDefault();
-
-    if (fotmobCache[`team_${clubName}`]) {
-      window.open(fotmobCache[`team_${clubName}`], '_blank');
-      return;
-    }
-
-    try {
-      const data = await api.get(`/fotmob/team/${encodeURIComponent(clubName)}`);
-      fotmobCache[`team_${clubName}`] = data.url;
-      window.open(data.url, '_blank');
-    } catch {
-      window.open(`https://www.google.com/search?q=fotmob+${encodeURIComponent(clubName)}`, '_blank');
-    }
+    const key = `team_${clubName}`;
+    await openTab(async () => {
+      if (!fotmobCache[key]) {
+        const data = await api.get(`/fotmob/team/${encodeURIComponent(clubName)}`);
+        fotmobCache[key] = data.url;
+      }
+      return fotmobCache[key];
+    }, `https://www.google.com/search?q=fotmob+${encodeURIComponent(clubName)}`);
   }, []);
 
   const PlayerLink = useCallback(({ id, name, children, style }) => (
